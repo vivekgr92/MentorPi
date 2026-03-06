@@ -1,0 +1,26 @@
+autonomous_explorer:
+  ros__parameters:
+    # LLM provider: "claude" or "openai"
+    llm_provider: "claude"
+
+    # API keys (prefer setting via environment variables instead)
+    # anthropic_api_key: ""
+    # openai_api_key: ""
+
+    # Model overrides
+    claude_model: "claude-sonnet-4-20250514"
+    openai_model: "gpt-4o"
+
+    # Exploration loop interval (seconds between LLM calls)
+    loop_interval: 3.0
+
+    # Safety distances (meters)
+    emergency_stop_distance: 0.20
+    caution_distance: 0.40
+
+    # Speed limits (m/s and rad/s)
+    max_linear_speed: 0.20
+    max_angular_speed: 0.80
+
+    # Voice I/O
+    voice_enabled: true

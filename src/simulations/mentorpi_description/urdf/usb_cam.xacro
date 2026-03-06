@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="usb_cam" xmlns:xacro="http://ros.org/wiki/xacro">
+  <link name="servo1_link">
+    <inertial>
+      <origin
+        xyz="0.0608772154459831 5.13559892594622E-06 0.0238352655915401"
+        rpy="0 0 0" />
+      <mass
+        value="0.00518451576871083" />
+      <inertia
+        ixx="1.19552510132493E-07"
+        ixy="8.09717056655972E-11"
+        ixz="-5.22612766693798E-09"
+        iyy="2.88482765596692E-07"
+        iyz="1.55583013750796E-10"
+        izz="3.22693410030829E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/servo1_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/servo1_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="base_linkservo1_joint"
+    type="fixed">
+    <origin
+      xyz="0.0 -0.0 -0.010497413059140228"
+      rpy="0.0 0.0 0.0" />
+    <parent
+      link="base_link" />
+    <child
+      link="servo1_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+  <link
+    name="bracker_1_link">
+    <inertial>
+      <origin
+        xyz="-0.000700278156409814 -0.00239964940148384 0.00953063098833723"
+        rpy="0 0 0" />
+      <mass
+        value="0.00255006123608218" />
+      <inertia
+        ixx="1.066690473469E-06"
+        ixy="-1.89775902140769E-12"
+        ixz="-2.94129560795889E-14"
+        iyy="2.88438283774852E-07"
+        iyz="-1.72719681537519E-08"
+        izz="9.28071485404138E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/bracker_1_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/bracker_1_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="servo1_bracker_1_joint"
+    type="revolute">
+    <origin
+      xyz="0.0659455260019063 2.3986756651247E-05 0.040033201670234"
+      rpy="0 0 0" />
+    <parent
+      link="servo1_link" />
+    <child
+      link="bracker_1_link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-3.14"
+      upper="3.14"
+      effort="100"
+      velocity="1" />
+  </joint>
+  <link
+    name="servo_2_link">
+    <inertial>
+      <origin
+        xyz="0.00057900245613085 -0.0069720647814423 -0.0192921660731133"
+        rpy="0 0 0" />
+      <mass
+        value="0.00829870823516926" />
+      <inertia
+        ixx="1.41074118890818E-06"
+        ixy="4.78865343036636E-08"
+        ixz="-5.03082675809146E-09"
+        iyy="1.01282185915807E-06"
+        iyz="3.2263606601339E-08"
+        izz="9.39299599442583E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/servo_2_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/servo_2_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="brack_1_servo_2_joint"
+    type="revolute">
+    <origin
+      xyz="0 -0.0227583589384592 0.0206766847200463"
+      rpy="1.5707963267949 -1.5707963267949 0" />
+    <parent
+      link="bracker_1_link" />
+    <child
+      link="servo_2_link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-3.14"
+      upper="3.14"
+      effort="100"
+      velocity="1" />
+  </joint>
+  <link
+    name="usb_cam_link">
+    <inertial>
+      <origin
+        xyz="8.1573480478791E-08 -7.27136190981081E-08 -0.00499337401936274"
+        rpy="0 0 0" />
+      <mass
+        value="0.00432477705040121" />
+      <inertia
+        ixx="1.22217448501737E-07"
+        ixy="-8.1760868902142E-13"
+        ixz="-1.79128130392433E-12"
+        iyy="1.50270053614083E-07"
+        iyz="4.69226782979303E-12"
+        izz="1.93430178867989E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/usb_cam_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://mentorpi_description/meshes/hardware/usb_cam_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="usb_cam_joint"
+    type="fixed">
+    <origin
+      xyz="0.00324838372605674 -0.0449422440915109 -0.0233507268248132"
+      rpy="1.5707963267949 -1.5707963267949 0" />
+    <parent
+      link="servo_2_link" />
+    <child
+      link="usb_cam_link" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+</robot>

@@ -1,0 +1,42 @@
+<?xml version="1.0" ?>
+<robot name="depth_cam" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:property name="M_PI"               value="3.1415926535897931"/>
+
+
+  <material name="black">
+    <color rgba="0 0 0 1"/>
+  </material>
+  
+  <link name="depth_cam">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0023402290706885 0.00113784597175737 -0.010212706399263"/>
+      <mass value="0.0270474748712619"/>
+      <inertia ixx="1.43718505980935E-05" ixy="1.24779390700312E-07" ixz="1.29836475580818E-08" iyy="1.65912768335363E-06" iyz="2.28291474116005E-08" izz="1.45615925671284E-05"/>
+    </inertial>
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://mentorpi_description/meshes/tank/depth_cam.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="package://mentorpi_description/meshes/tank/depth_cam.STL"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="cam_Joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.07955 -0.00013463 0.042754"/>
+    <parent link="base_link"/>
+    <child link="depth_cam"/>
+    <axis xyz="0 0 0"/>
+  </joint>
+
+
+</robot>

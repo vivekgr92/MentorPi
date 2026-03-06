@@ -1,0 +1,41 @@
+# Build artifacts (colcon)
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Environment / secrets
+.env
+*.key
+credentials*
+
+# Claude Code
+.claude/
+
+# Large model files
+*.pt
+*.onnx
+*.engine
+*.task
+*.tflite
+*.so
+
+# Third-party packages (install separately)
+src/deptrum-ros-driver-aurora930/
+src/ldlidar_stl_ros2/
+src/deps/
+
+# Explorer logs
+mentorpi_explorer/
+
+# Temp files
+*.tmp.*
+
+# OS
+.DS_Store
+Thumbs.db
