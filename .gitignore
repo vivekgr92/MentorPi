@@ -17,13 +17,14 @@ credentials*
 # Claude Code
 .claude/
 
-# Large model files
+# Large binary/model files
 *.pt
 *.onnx
 *.engine
 *.task
 *.tflite
 *.so
+*.stl
 
 # Third-party packages (install separately)
 src/deptrum-ros-driver-aurora930/
