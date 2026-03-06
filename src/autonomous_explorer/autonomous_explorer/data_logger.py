@@ -166,6 +166,9 @@ class DataLogger:
         areas_visited: int = 0,
         objects_discovered: list | None = None,
         map_coverage_pct: float = 0.0,
+        # Consciousness
+        embodied_reflection: str = '',
+        outing_number: int = 0,
     ):
         """Enqueue a complete cycle record for background writing."""
         self._cycle_counter += 1
@@ -284,6 +287,11 @@ class DataLogger:
                     'areas_visited': areas_visited,
                     'objects_discovered': objects_discovered or [],
                     'current_map_coverage_pct': map_coverage_pct,
+                },
+
+                'consciousness': {
+                    'embodied_reflection': embodied_reflection,
+                    'outing_number': outing_number,
                 },
             }
 

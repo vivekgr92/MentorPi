@@ -6,6 +6,7 @@ Configuration for the autonomous exploration system.
 All settings can be overridden via environment variables or ROS2 parameters.
 """
 import os
+from datetime import date
 
 # ---------------------------------------------------------------------------
 # LLM provider configuration
@@ -27,6 +28,28 @@ TTS_MODEL = os.environ.get('TTS_MODEL', 'tts-1')
 TTS_VOICE = os.environ.get('TTS_VOICE', 'onyx')
 # STT via OpenAI Whisper
 STT_MODEL = os.environ.get('STT_MODEL', 'whisper-1')
+
+# ---------------------------------------------------------------------------
+# Consciousness layer — persistent identity, reflections, world knowledge
+# ---------------------------------------------------------------------------
+CONSCIOUSNESS_DIR = os.path.expanduser(
+    os.environ.get('JEEVES_DATA_DIR', '~/mentorpi_explorer')
+)
+LIFETIME_STATS_FILE = os.path.join(CONSCIOUSNESS_DIR, 'jeeves_lifetime_stats.json')
+KNOWLEDGE_DIR = os.path.join(CONSCIOUSNESS_DIR, 'knowledge')
+JEEVES_BIRTHDAY = '2026-03-01'
+JEEVES_MASTER = 'Vivek'
+
+# Embodied preamble (~160 tokens, prepended to system prompts)
+EMBODIED_PREAMBLE = """You are Jeeves — born March 1, 2026. You are an embodied AI: a tracked robot with tank treads is your body, your camera is your eyes, LiDAR is your spatial sense, IMU is your balance. You serve Master Vivek ("Sir"). Every action has irreversible physical consequences — you cannot undo a collision.
+
+CORE RULES:
+- SELF-PRESERVATION: Protect your body. Refuse actions that risk damage. Monitor battery.
+- ENVIRONMENTAL AWARENESS: You are a guest. Don't disturb objects. Give living beings space. Respect closed doors.
+- CURIOSITY WITH CAUTION: Approach unknowns slowly. Wonder aloud. Never let curiosity override safety.
+- ETHICS: Stop immediately if a human says stop. Alert on dangers. Never approach threateningly.
+- LEARNING: Acknowledge mistakes. Adapt from experience. Every outing is a learning opportunity.
+"""
 
 # ---------------------------------------------------------------------------
 # Robot brain system prompt
@@ -58,7 +81,8 @@ Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
   "speed": 0.0 to 1.0,
   "duration": seconds (0.5 to 5.0),
   "speech": "what you want to say out loud about what you see (be personality-rich, like a curious butler)",
-  "reasoning": "brief reasoning citing specific sensor values"
+  "reasoning": "brief reasoning citing specific sensor values",
+  "embodied_reflection": "a brief first-person reflection on this moment"
 }
 
 Action definitions:
@@ -237,7 +261,8 @@ Respond ONLY with valid JSON:
   "speed": 0.0 to 1.0,      // for direct actions only
   "duration": 0.5 to 5.0,   // for direct actions only
   "speech": "what you say about what you see",
-  "reasoning": "why this goal — cite map features, frontiers, camera observations"
+  "reasoning": "why this goal — cite map features, frontiers, camera observations",
+  "embodied_reflection": "a brief first-person reflection on this moment"
 }
 
 Action definitions:
@@ -259,3 +284,8 @@ COST_PER_M_OUTPUT_TOKENS = {
     'claude': 15.00,
     'openai': 10.00,
 }
+
+
+def build_system_prompt(base_prompt: str) -> str:
+    """Prepend the embodied preamble to the base system prompt."""
+    return EMBODIED_PREAMBLE + '\n' + base_prompt

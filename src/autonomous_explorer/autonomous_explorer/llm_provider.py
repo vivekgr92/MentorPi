@@ -162,7 +162,7 @@ class ClaudeProvider(LLMProvider):
 
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=512,
+                max_tokens=600,
                 system=system_prompt,
                 messages=[{'role': 'user', 'content': content}],
             )
@@ -219,7 +219,7 @@ class OpenAIProvider(LLMProvider):
 
             response = self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=512,
+                max_tokens=600,
                 messages=[
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': content},

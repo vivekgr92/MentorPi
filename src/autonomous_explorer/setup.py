@@ -35,6 +35,7 @@ setup(
         'scripts/analytics_dashboard.py',
         'scripts/dashboard.py',
         'scripts/dataset_export.py',
+        'scripts/jeeves_knowledge.py',
     ],
     entry_points={
         'console_scripts': [

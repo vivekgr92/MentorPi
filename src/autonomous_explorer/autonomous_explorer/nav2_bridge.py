@@ -39,8 +39,8 @@ _COLOR_GOAL = (0, 255, 0)          # green
 _COLOR_FRONTIER = (255, 165, 0)    # orange
 _COLOR_PATH = (255, 0, 0)          # blue
 
-# Map image size sent to LLM
-_MAP_IMAGE_SIZE = 256
+# Map image size sent to LLM (imported from config)
+from autonomous_explorer.config import MAP_IMAGE_SIZE as _MAP_IMAGE_SIZE
 
 
 class Nav2Bridge:
@@ -75,8 +75,9 @@ class Nav2Bridge:
         # Map subscriber
         self._map_msg = None
         self._map_lock = threading.Lock()
+        from autonomous_explorer.config import NAV2_MAP_TOPIC
         self._map_sub = node.create_subscription(
-            OccupancyGrid, '/map', self._map_callback, 10,
+            OccupancyGrid, NAV2_MAP_TOPIC, self._map_callback, 10,
         )
 
         # Rendered map cache

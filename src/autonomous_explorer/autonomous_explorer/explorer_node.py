@@ -58,11 +58,15 @@ from autonomous_explorer.config import (
     CAUTION_DISTANCE,
     CLAUDE_MODEL,
     CMD_VEL_TOPIC,
+    CONSCIOUSNESS_DIR,
     COST_PER_M_INPUT_TOKENS,
     COST_PER_M_OUTPUT_TOKENS,
     EMERGENCY_STOP_DISTANCE,
     HYBRID_SYSTEM_PROMPT,
     IMU_TOPIC,
+    JEEVES_BIRTHDAY,
+    JEEVES_MASTER,
+    KNOWLEDGE_DIR,
     LIDAR_MAX_SCAN_ANGLE,
     LIDAR_TOPIC,
     LINEAR_ACCEL,
@@ -106,8 +110,11 @@ from autonomous_explorer.config import (
     USE_TWIST_MUX,
     VOICE_ENABLED,
     WONDERECHO_PORT,
+    build_system_prompt,
 )
+from autonomous_explorer.consciousness import JeevesConsciousness
 from autonomous_explorer.nav2_bridge import NAV2_AVAILABLE
+from autonomous_explorer.world_knowledge import WorldKnowledge
 from autonomous_explorer.data_logger import DataLogger
 from autonomous_explorer.exploration_memory import ExplorationMemory
 from autonomous_explorer.joystick_reader import JoystickReader
@@ -338,6 +345,24 @@ class AutonomousExplorer(Node):
         self.data_logger.start()
 
         # ------------------------------------------------------------------
+        # Consciousness layer (persistent identity + reflections)
+        # ------------------------------------------------------------------
+        self.consciousness = JeevesConsciousness(
+            stats_dir=CONSCIOUSNESS_DIR,
+            birthday=JEEVES_BIRTHDAY,
+            master=JEEVES_MASTER,
+            logger=self.get_logger(),
+        )
+
+        # ------------------------------------------------------------------
+        # World knowledge (persistent rooms, objects, behaviors)
+        # ------------------------------------------------------------------
+        self.world_knowledge = WorldKnowledge(
+            knowledge_dir=KNOWLEDGE_DIR,
+            logger=self.get_logger(),
+        )
+
+        # ------------------------------------------------------------------
         # ROS2 publishers + velocity ramper
         # ------------------------------------------------------------------
         self.use_twist_mux = USE_TWIST_MUX
@@ -468,6 +493,12 @@ class AutonomousExplorer(Node):
                 target=self._voice_listener_loop, daemon=True,
             )
             self._voice_thread.start()
+
+        # Speak session intro greeting
+        intro = self.consciousness.get_session_intro()
+        self.get_logger().info(f'Jeeves: {intro}')
+        if self.voice_on:
+            self.voice.speak(intro)
 
         self.get_logger().info(
             'Autonomous Explorer ready. '
@@ -1415,13 +1446,25 @@ class AutonomousExplorer(Node):
                             + '\n'.join(parts)
                         )
 
-                # Select system prompt based on mode
-                active_prompt = (
+                # Select system prompt based on mode (with embodied preamble)
+                base_prompt = (
                     HYBRID_SYSTEM_PROMPT if self.use_nav2
                     else SYSTEM_PROMPT
                 )
+                active_prompt = build_system_prompt(base_prompt)
 
-                user_prompt = (
+                # Build user prompt with identity + knowledge context
+                identity_context = self.consciousness.get_identity_context()
+                knowledge_context = self.world_knowledge.get_prompt_context(
+                    x=odom_snapshot.get('x', 0) if odom_snapshot else 0,
+                    y=odom_snapshot.get('y', 0) if odom_snapshot else 0,
+                    theta=odom_snapshot.get('theta', 0) if odom_snapshot else 0,
+                )
+
+                user_prompt = f'{identity_context}\n\n'
+                if knowledge_context:
+                    user_prompt += f'{knowledge_context}\n\n'
+                user_prompt += (
                     f'Current sensor data:\n'
                     f'{lidar_summary}\n'
                     f'{depth_summary}\n'
@@ -1538,6 +1581,32 @@ class AutonomousExplorer(Node):
                     self.get_logger().info(f'Reasoning: {reasoning[:120]}')
 
                 # ----------------------------------------------------------
+                # CONSCIOUSNESS: Track reflection and update knowledge
+                # ----------------------------------------------------------
+                reflection = result.get('embodied_reflection', '')
+                if reflection:
+                    self.consciousness.record_reflection(reflection)
+
+                # Compute distance delta for this cycle
+                _dist_delta = 0.0
+                if odom_snapshot and self._prev_odom_x is not None:
+                    dx = odom_snapshot.get('x', 0) - self._prev_odom_x
+                    dy = odom_snapshot.get('y', 0) - self._prev_odom_y
+                    _dist_delta = math.sqrt(dx * dx + dy * dy)
+
+                self.consciousness.record_cycle(
+                    result, safety_info, cost_usd,
+                    distance_delta=_dist_delta,
+                )
+                self.world_knowledge.update_from_response(
+                    result, odom=odom_snapshot,
+                )
+
+                # Detect room mentions for consciousness tracking
+                for room in self.world_knowledge.world_map.get('rooms', {}):
+                    self.consciousness.record_room(room)
+
+                # ----------------------------------------------------------
                 # LOG: Full cycle record for dataset collection
                 # ----------------------------------------------------------
                 self.data_logger.log_cycle(
@@ -1593,6 +1662,9 @@ class AutonomousExplorer(Node):
                         if self.use_nav2 and self.nav2 and self.nav2.has_map
                         else 0.0
                     ),
+                    # Consciousness
+                    embodied_reflection=reflection,
+                    outing_number=self.consciousness.outing_number,
                 )
 
                 # ----------------------------------------------------------
@@ -1661,6 +1733,18 @@ class AutonomousExplorer(Node):
         if self.nav2:
             self.nav2.cancel_navigation()
             self.nav2.destroy()
+
+        # Consciousness: save stats, write journal, update knowledge
+        self.consciousness.save()
+        try:
+            self.consciousness.write_journal(self.memory, self.llm)
+        except Exception as e:
+            self.get_logger().warning(f'Journal write failed: {e}')
+        try:
+            self.world_knowledge.end_of_session_update(self.memory, self.llm)
+        except Exception as e:
+            self.get_logger().warning(f'Knowledge update failed: {e}')
+
         if self.voice_on:
             self.voice.speak('Exploration complete. Shutting down.', block=True)
         self.get_logger().info('Shutdown complete.')

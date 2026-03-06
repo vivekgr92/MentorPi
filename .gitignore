@@ -29,6 +29,7 @@ credentials*
 # Third-party packages (install separately)
 src/deptrum-ros-driver-aurora930/
 src/ldlidar_stl_ros2/
+src/foxglove_bridge/
 src/deps/
 
 # Explorer logs
