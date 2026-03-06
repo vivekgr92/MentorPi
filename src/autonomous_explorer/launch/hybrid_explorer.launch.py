@@ -117,23 +117,17 @@ def generate_launch_description():
         ],
     )
 
-    # ── Nav2 component container ──
-    nav2_container = Node(
-        package='rclcpp_components',
-        executable='component_container_isolated',
-        name='nav2_container',
-        parameters=[nav2_params, {'autostart': True}],
-        output='screen',
-    )
-
-    # ── Nav2 nodes (loaded into container after delay) ──
-    # These are launched as regular nodes instead of composable for simplicity
+    # ── Nav2 nodes ──
+    # When twist_mux is active, Nav2 publishes to /cmd_vel/nav2 (mux handles routing).
+    # Otherwise it publishes directly to /controller/cmd_vel.
+    use_twist_mux = os.environ.get('USE_TWIST_MUX', 'true').lower() == 'true'
+    nav2_cmd_vel = '/cmd_vel/nav2' if use_twist_mux else '/controller/cmd_vel'
     nav2_controller = Node(
         package='nav2_controller',
         executable='controller_server',
         name='controller_server',
         parameters=[nav2_params],
-        remappings=[('cmd_vel', '/controller/cmd_vel')],
+        remappings=[('cmd_vel', '/cmd_vel_nav2_raw')],
         output='screen',
     )
 
@@ -169,14 +163,16 @@ def generate_launch_description():
         output='screen',
     )
 
+    # velocity_smoother sits between controller_server and the output topic.
+    # Input: /cmd_vel_nav2_raw (from controller_server), Output: nav2_cmd_vel
     nav2_velocity = Node(
         package='nav2_velocity_smoother',
         executable='velocity_smoother',
         name='velocity_smoother',
         parameters=[nav2_params],
         remappings=[
-            ('cmd_vel', '/controller/cmd_vel'),
-            ('cmd_vel_smoothed', '/controller/cmd_vel'),
+            ('cmd_vel', '/cmd_vel_nav2_raw'),
+            ('cmd_vel_smoothed', nav2_cmd_vel),
         ],
         output='screen',
     )

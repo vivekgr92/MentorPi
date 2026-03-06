@@ -1,0 +1,46 @@
+# twist_mux — priority-based cmd_vel multiplexer
+#
+# Multiple sources can publish velocity commands. twist_mux selects the
+# highest-priority active source and forwards it to the output topic.
+#
+# Priority 0 = highest. A source is "active" if it published within its
+# timeout window. If no source is active, output is zero.
+#
+# Lock topics: publishing True on a lock topic forces output to zero
+# regardless of other inputs (used for emergency stop).
+#
+# Install: sudo apt install ros-jazzy-twist-mux
+#
+twist_mux:
+  ros__parameters:
+    topics:
+      # Emergency safety controller (highest priority)
+      safety:
+        topic: /cmd_vel/safety
+        timeout: 0.5
+        priority: 0
+
+      # Joystick manual control
+      joystick:
+        topic: /cmd_vel/joystick
+        timeout: 0.5
+        priority: 1
+
+      # Nav2 controller (hybrid mode path following)
+      navigation:
+        topic: /cmd_vel/nav2
+        timeout: 0.5
+        priority: 2
+
+      # LLM autonomous explorer commands
+      autonomous:
+        topic: /cmd_vel/autonomous
+        timeout: 0.5
+        priority: 3
+
+    locks:
+      # Emergency stop lock — publishing True forces zero velocity
+      e_stop:
+        topic: /cmd_vel/e_stop_lock
+        timeout: 0.0
+        priority: 255

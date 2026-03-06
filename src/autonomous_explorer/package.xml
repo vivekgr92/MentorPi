@@ -23,6 +23,9 @@
   <!-- Optional: Foxglove remote visualization -->
   <exec_depend>foxglove_bridge</exec_depend>
 
+  <!-- Optional: twist_mux priority cmd_vel multiplexer -->
+  <exec_depend>twist_mux</exec_depend>
+
   <!-- Optional: Nav2 hybrid mode (install via install_nav2.sh) -->
   <exec_depend condition="$USE_NAV2">nav2_msgs</exec_depend>
   <exec_depend condition="$USE_NAV2">tf2_ros</exec_depend>

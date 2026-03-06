@@ -84,6 +84,29 @@ MOTOR_TIMEOUT = 6.0              # seconds — stop if no new command
 LIDAR_MAX_SCAN_ANGLE = 240       # degrees — exclude rear blind spot
 
 # ---------------------------------------------------------------------------
+# Velocity ramping (trapezoidal profiles)
+# Prevents wheel slip and jerky motion on tracked chassis
+# ---------------------------------------------------------------------------
+LINEAR_ACCEL = 0.5               # m/s² — how fast we ramp up linear velocity
+LINEAR_DECEL = 0.8               # m/s² — braking is faster than acceleration
+ANGULAR_ACCEL = 2.0              # rad/s² — angular ramp rate
+ANGULAR_DECEL = 3.0              # rad/s² — angular braking rate
+RAMPER_UPDATE_RATE = 20.0        # Hz — velocity ramper control loop rate
+
+# ---------------------------------------------------------------------------
+# twist_mux topic names (priority-based cmd_vel multiplexer)
+# When twist_mux is running, each source publishes to its own topic and
+# twist_mux forwards the highest-priority active source to CMD_VEL_TOPIC.
+# When twist_mux is NOT running, we publish directly to CMD_VEL_TOPIC.
+# ---------------------------------------------------------------------------
+USE_TWIST_MUX = os.environ.get('USE_TWIST_MUX', 'true').lower() == 'true'
+TWIST_MUX_AUTONOMOUS_TOPIC = '/cmd_vel/autonomous'
+TWIST_MUX_JOYSTICK_TOPIC = '/cmd_vel/joystick'
+TWIST_MUX_NAV2_TOPIC = '/cmd_vel/nav2'
+TWIST_MUX_SAFETY_TOPIC = '/cmd_vel/safety'
+TWIST_MUX_LOCK_TOPIC = '/cmd_vel/e_stop_lock'
+
+# ---------------------------------------------------------------------------
 # Exploration loop timing
 # ---------------------------------------------------------------------------
 LOOP_INTERVAL = 3.0              # seconds between LLM calls

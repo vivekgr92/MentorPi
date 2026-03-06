@@ -49,20 +49,29 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _parse_response(text: str) -> dict:
-        """Extract JSON from LLM response text, handling markdown fences."""
+        """Extract JSON from LLM response text, handling markdown fences.
+
+        Sets '_parse_failed' key in the result dict when parsing falls back
+        to the default stop action. This is critical for benchmarking —
+        it distinguishes "LLM chose to stop" from "LLM returned garbage".
+        """
         text = text.strip()
         # Strip markdown code fences if present
         fence_match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
         if fence_match:
             text = fence_match.group(1).strip()
         try:
-            return json.loads(text)
+            result = json.loads(text)
+            result['_parse_failed'] = False
+            return result
         except json.JSONDecodeError:
             # Try to find a JSON object in the text
             brace_match = re.search(r'\{[\s\S]*\}', text)
             if brace_match:
                 try:
-                    return json.loads(brace_match.group())
+                    result = json.loads(brace_match.group())
+                    result['_parse_failed'] = False
+                    return result
                 except json.JSONDecodeError:
                     pass
         return {
@@ -71,6 +80,7 @@ class LLMProvider(ABC):
             'duration': 0.0,
             'speech': 'I had trouble thinking. Stopping to be safe.',
             'reasoning': f'Failed to parse LLM response: {text[:200]}',
+            '_parse_failed': True,
         }
 
     def _safe_fallback(self, error_msg: str) -> dict:
@@ -122,7 +132,7 @@ class ClaudeProvider(LLMProvider):
 
     def __init__(self, api_key: str, model: str = 'claude-sonnet-4-20250514'):
         import anthropic
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = anthropic.Anthropic(api_key=api_key, timeout=20.0)
         self.model = model
 
     def analyze_scene(
@@ -181,7 +191,7 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, api_key: str, model: str = 'gpt-4o'):
         import openai
-        self.client = openai.OpenAI(api_key=api_key)
+        self.client = openai.OpenAI(api_key=api_key, timeout=20.0)
         self.model = model
 
     def analyze_scene(

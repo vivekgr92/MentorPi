@@ -138,6 +138,7 @@ export LIDAR_TYPE
 export need_compile
 export LLM_PROVIDER="$PROVIDER"
 export EXPLORER_LOG_LEVEL="$LOG_LEVEL"
+export USE_TWIST_MUX="true"
 
 # ── Validate API keys (skip for dry-run) ──────────────────────────────────
 if [[ "$PROVIDER" == "dryrun" ]]; then
@@ -358,6 +359,32 @@ if [[ "$FOXGLOVE" == "true" ]]; then
         echo "WARNING: foxglove_bridge not installed — remote visualization disabled."
         echo "  Install: sudo apt install ros-jazzy-foxglove-bridge"
     fi
+fi
+
+# ── Launch twist_mux (priority-based cmd_vel multiplexer) ─────────────────
+if ros2 pkg list 2>/dev/null | grep -q twist_mux; then
+    _TMUX_CONFIG=""
+    if [[ "$need_compile" == "True" ]]; then
+        _TMUX_SHARE="$(ros2 pkg prefix autonomous_explorer 2>/dev/null)/share/autonomous_explorer/config/twist_mux.yaml"
+        if [[ -f "$_TMUX_SHARE" ]]; then
+            _TMUX_CONFIG="$_TMUX_SHARE"
+        fi
+    fi
+    if [[ -z "$_TMUX_CONFIG" ]]; then
+        _TMUX_CONFIG="$WS_ROOT/src/autonomous_explorer/config/twist_mux.yaml"
+    fi
+
+    echo ">>> Launching twist_mux (priority cmd_vel multiplexer)..."
+    echo "    Priorities: safety(0) > joystick(1) > nav2(2) > autonomous(3)"
+    ros2 run twist_mux twist_mux --ros-args \
+        --params-file "$_TMUX_CONFIG" \
+        -r cmd_vel_out:=/controller/cmd_vel &
+    PIDS+=($!)
+    sleep 1
+else
+    echo "WARNING: twist_mux not installed — using direct cmd_vel."
+    echo "  Install: sudo apt install ros-jazzy-twist-mux"
+    export USE_TWIST_MUX="false"
 fi
 
 # ── Launch the explorer ────────────────────────────────────────────────────

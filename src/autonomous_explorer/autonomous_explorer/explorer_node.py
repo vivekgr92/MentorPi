@@ -47,6 +47,8 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 
 from autonomous_explorer.config import (
+    ANGULAR_ACCEL,
+    ANGULAR_DECEL,
     ANTHROPIC_API_KEY,
     AUDIO_DEVICE,
     BATTERY_TOPIC,
@@ -63,6 +65,8 @@ from autonomous_explorer.config import (
     IMU_TOPIC,
     LIDAR_MAX_SCAN_ANGLE,
     LIDAR_TOPIC,
+    LINEAR_ACCEL,
+    LINEAR_DECEL,
     LLM_PROVIDER,
     LOG_COMPRESS_AFTER_HOURS,
     LOG_DIR,
@@ -80,6 +84,7 @@ from autonomous_explorer.config import (
     ODOM_TOPIC,
     OPENAI_API_KEY,
     OPENAI_MODEL,
+    RAMPER_UPDATE_RATE,
     SAFE_DISTANCE,
     SERVO_CENTER,
     SERVO_MAX,
@@ -94,7 +99,11 @@ from autonomous_explorer.config import (
     SYSTEM_PROMPT,
     TTS_MODEL,
     TTS_VOICE,
+    TWIST_MUX_AUTONOMOUS_TOPIC,
+    TWIST_MUX_JOYSTICK_TOPIC,
+    TWIST_MUX_LOCK_TOPIC,
     USE_NAV2,
+    USE_TWIST_MUX,
     VOICE_ENABLED,
     WONDERECHO_PORT,
 )
@@ -103,6 +112,7 @@ from autonomous_explorer.data_logger import DataLogger
 from autonomous_explorer.exploration_memory import ExplorationMemory
 from autonomous_explorer.joystick_reader import JoystickReader
 from autonomous_explorer.llm_provider import create_provider
+from autonomous_explorer.velocity_ramper import VelocityRamper
 from autonomous_explorer.voice_io import VoiceIO, WonderEchoDetector
 
 
@@ -204,6 +214,15 @@ class AutonomousExplorer(Node):
         self._last_twist = (0.0, 0.0)  # (linear_x, angular_z)
         self._last_servo_pan = SERVO_CENTER
         self._last_servo_tilt = SERVO_CENTER
+
+        # Odometry-based distance tracking + stuck detection
+        self._total_distance = 0.0      # cumulative meters traveled
+        self._prev_odom_x = None
+        self._prev_odom_y = None
+        self._stuck_check_distance = 0.0  # distance at last stuck check
+        self._stuck_check_cycle = 0       # cycle at last stuck check
+        self._stuck_cycles_threshold = 8  # check every N cycles
+        self._stuck_distance_threshold = 0.3  # must move at least this far
         # Latest voice command text (consumed per cycle)
         self._last_voice_cmd = None
 
@@ -290,8 +309,6 @@ class AutonomousExplorer(Node):
         # ------------------------------------------------------------------
         # Initialize voice I/O
         # ------------------------------------------------------------------
-        # Use openai key for TTS/STT regardless of LLM provider
-        tts_key = self.openai_key or self.anthropic_key
         self.voice = VoiceIO(
             openai_api_key=self.openai_key,
             tts_model=TTS_MODEL,
@@ -321,9 +338,56 @@ class AutonomousExplorer(Node):
         self.data_logger.start()
 
         # ------------------------------------------------------------------
-        # ROS2 publishers
+        # ROS2 publishers + velocity ramper
         # ------------------------------------------------------------------
-        self.cmd_vel_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 1)
+        self.use_twist_mux = USE_TWIST_MUX
+
+        if self.use_twist_mux:
+            # twist_mux mode: separate topics per source, mux outputs to CMD_VEL
+            self._auto_pub = self.create_publisher(
+                Twist, TWIST_MUX_AUTONOMOUS_TOPIC, 1)
+            self._joy_pub = self.create_publisher(
+                Twist, TWIST_MUX_JOYSTICK_TOPIC, 1)
+            from std_msgs.msg import Bool
+            self._estop_lock_pub = self.create_publisher(
+                Bool, TWIST_MUX_LOCK_TOPIC, 1)
+            # Default motor output goes through autonomous topic
+            self.cmd_vel_pub = self._auto_pub
+        else:
+            # Direct mode: everything publishes to the same CMD_VEL topic
+            self.cmd_vel_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 1)
+            self._auto_pub = self.cmd_vel_pub
+            self._joy_pub = self.cmd_vel_pub
+            self._estop_lock_pub = None
+
+        # Velocity ramper: smooths step commands into trapezoidal profiles
+        self._ramper = VelocityRamper(
+            publisher=self._auto_pub,
+            max_linear=self.max_linear,
+            max_angular=self.max_angular,
+            linear_accel=LINEAR_ACCEL,
+            linear_decel=LINEAR_DECEL,
+            angular_accel=ANGULAR_ACCEL,
+            angular_decel=ANGULAR_DECEL,
+            update_rate=RAMPER_UPDATE_RATE,
+            logger=self.get_logger(),
+        )
+        self._ramper.start()
+
+        # Joystick ramper (separate instance for independent control)
+        self._joy_ramper = VelocityRamper(
+            publisher=self._joy_pub,
+            max_linear=self.max_linear,
+            max_angular=self.max_angular,
+            linear_accel=LINEAR_ACCEL,
+            linear_decel=LINEAR_DECEL,
+            angular_accel=ANGULAR_ACCEL,
+            angular_decel=ANGULAR_DECEL,
+            update_rate=RAMPER_UPDATE_RATE,
+            logger=self.get_logger(),
+        )
+        self._joy_ramper.start()
+
         self.servo_pub = self.create_publisher(
             SetPWMServoState, SERVO_TOPIC, 1,
         )
@@ -485,17 +549,49 @@ class AutonomousExplorer(Node):
             self._lidar_ranges = sectors
             self._lidar_raw = msg
 
-        # Emergency stop check — front sector
-        if sectors['front'] < self.e_stop_dist:
+        # Emergency stop check — direction-aware
+        # Check sectors relevant to current motion direction
+        cur_lin, cur_ang = self._ramper.current_velocity
+        threat_dist = float('inf')
+        threat_sector = ''
+
+        if cur_lin > 0.01:
+            # Moving forward: check front
+            threat_dist = sectors['front']
+            threat_sector = 'front'
+        elif cur_lin < -0.01:
+            # Moving backward: check back
+            threat_dist = sectors['back']
+            threat_sector = 'back'
+
+        if abs(cur_ang) > 0.1:
+            # Spinning: check the side we're turning toward
+            side = 'left' if cur_ang > 0 else 'right'
+            if sectors[side] < threat_dist:
+                threat_dist = sectors[side]
+                threat_sector = side
+
+        # Also always check front (even when stationary, for safety)
+        if sectors['front'] < threat_dist:
+            threat_dist = sectors['front']
+            threat_sector = 'front'
+
+        if threat_dist < self.e_stop_dist:
             if not self.emergency_stop:
                 self.get_logger().warn(
-                    f"EMERGENCY STOP! Obstacle at {sectors['front']:.2f}m"
+                    f"EMERGENCY STOP! Obstacle {threat_sector} at {threat_dist:.2f}m"
                 )
                 self.emergency_stop = True
-                self._stop_motors()
-        elif self.emergency_stop and sectors['front'] > self.e_stop_dist * 1.5:
-            self.get_logger().info('Front cleared, resuming...')
+                self._emergency_stop_motors()
+        elif self.emergency_stop and sectors.get('overall', float('inf')) > self.e_stop_dist * 2.0:
+            # Clear when ALL directions have more clearance (wider hysteresis)
+            self.get_logger().info('Surroundings cleared, resuming...')
             self.emergency_stop = False
+            if self._estop_lock_pub:
+                from std_msgs.msg import Bool
+                msg = Bool()
+                msg.data = False
+                self._estop_lock_pub.publish(msg)
 
     def _imu_callback(self, msg: Imu):
         """Store latest IMU reading."""
@@ -531,12 +627,21 @@ class AutonomousExplorer(Node):
             self._imu_data = data
 
     def _odom_callback(self, msg: Odometry):
-        """Store latest odometry reading."""
+        """Store latest odometry reading and accumulate distance traveled."""
         pos = msg.pose.pose.position
         q = msg.pose.pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         theta = math.atan2(siny, cosy)
+
+        # Accumulate distance
+        if self._prev_odom_x is not None:
+            dx = pos.x - self._prev_odom_x
+            dy = pos.y - self._prev_odom_y
+            self._total_distance += math.sqrt(dx * dx + dy * dy)
+        self._prev_odom_x = pos.x
+        self._prev_odom_y = pos.y
+
         data = {
             'x': round(pos.x, 4),
             'y': round(pos.y, 4),
@@ -653,27 +758,42 @@ class AutonomousExplorer(Node):
     # ======================================================================
 
     def _send_twist(self, linear_x: float, angular_z: float):
-        """Send a Twist command with speed limiting."""
+        """Set target velocity — ramper smoothly approaches it."""
         if self.emergency_stop and linear_x > 0:
             self.get_logger().warn('Emergency stop active — blocking forward')
             linear_x = 0.0
             angular_z = 0.0
 
-        # Clamp speeds
-        linear_x = max(-self.max_linear, min(self.max_linear, linear_x))
-        angular_z = max(-self.max_angular, min(self.max_angular, angular_z))
+        self._ramper.set_target(linear_x, angular_z)
+        self._last_command_time = time.time()
+        self._last_twist = (linear_x, angular_z)
 
-        msg = Twist()
-        msg.linear.x = linear_x
-        msg.angular.z = angular_z
-        self.cmd_vel_pub.publish(msg)
+    def _send_twist_joy(self, linear_x: float, angular_z: float):
+        """Set target velocity for joystick — uses joystick ramper."""
+        if self.emergency_stop and linear_x > 0:
+            linear_x = 0.0
+            angular_z = 0.0
+
+        self._joy_ramper.set_target(linear_x, angular_z)
         self._last_command_time = time.time()
         self._last_twist = (linear_x, angular_z)
 
     def _stop_motors(self):
-        """Immediately stop all motors."""
-        msg = Twist()
-        self.cmd_vel_pub.publish(msg)
+        """Stop all motors (smooth ramp-down via ramper)."""
+        self._ramper.stop()
+        self._joy_ramper.stop()
+        self._last_command_time = time.time()
+        self._last_twist = (0.0, 0.0)
+
+    def _emergency_stop_motors(self):
+        """Hard-stop all motors immediately (no ramp)."""
+        self._ramper.emergency_stop()
+        self._joy_ramper.emergency_stop()
+        if self._estop_lock_pub:
+            from std_msgs.msg import Bool
+            msg = Bool()
+            msg.data = True
+            self._estop_lock_pub.publish(msg)
         self._last_command_time = time.time()
         self._last_twist = (0.0, 0.0)
 
@@ -821,19 +941,32 @@ class AutonomousExplorer(Node):
                 safety['override_action'] = 'stop'
                 return safety
 
-            # Wait for navigation to complete (with timeout)
+            # Non-blocking navigation: check progress every second,
+            # allow early exit so the exploration loop can re-evaluate.
+            # The LLM re-assesses every NAV2_CHECK_INTERVAL seconds.
+            nav2_check_interval = 8.0  # seconds between LLM re-evaluations
             t_start = time.time()
             while (self.nav2.is_navigating
                    and self.running
                    and time.time() - t_start < NAV2_GOAL_TIMEOUT):
                 if self.emergency_stop:
                     self.nav2.cancel_navigation()
-                    self._stop_motors()
+                    self._emergency_stop_motors()
                     safety['triggered'] = True
                     safety['reason'] = 'emergency stop during navigation'
                     safety['override_action'] = 'stop'
                     return safety
-                time.sleep(0.2)
+                # After nav2_check_interval, return to the exploration loop
+                # so the LLM can re-evaluate with fresh sensor data.
+                # Nav2 keeps navigating in the background.
+                if time.time() - t_start >= nav2_check_interval:
+                    self.get_logger().info(
+                        'Nav2 still navigating — returning to LLM for re-evaluation'
+                    )
+                    safety['nav2_in_progress'] = True
+                    safety['nav2_goal'] = (goal_x, goal_y)
+                    return safety
+                time.sleep(0.5)
 
             result = self.nav2.navigation_result
             if result == 'succeeded':
@@ -907,16 +1040,26 @@ class AutonomousExplorer(Node):
             safety['override_action'] = 'stop'
             return safety
 
-        # Execute for the specified duration, checking safety continuously
-        while time.time() - exec_start < duration and self.running:
+        # Execute for the specified duration, checking safety continuously.
+        # Begin deceleration before duration ends for smooth stop.
+        decel_time = min(0.4, duration * 0.3)  # ramp down over last 0.4s (or 30%)
+        decel_start = duration - decel_time
+
+        while self.running:
+            elapsed = time.time() - exec_start
+            if elapsed >= duration:
+                break
             if self.emergency_stop:
                 self.get_logger().warn('Emergency stop during action!')
-                self._stop_motors()
+                self._emergency_stop_motors()
                 safety['triggered'] = True
                 safety['reason'] = 'emergency stop during execution'
                 safety['override_action'] = 'stop'
                 return safety
-            time.sleep(0.1)
+            # Begin smooth deceleration before end of duration
+            if elapsed >= decel_start:
+                self._ramper.stop()
+            time.sleep(0.05)
 
         self._stop_motors()
         return safety
@@ -990,10 +1133,10 @@ class AutonomousExplorer(Node):
 
                 if abs(linear_x) > 0.001 or abs(angular_z) > 0.001:
                     self._joystick_moving = True
-                    self._send_twist(linear_x, angular_z)
+                    self._send_twist_joy(linear_x, angular_z)
                 elif self._joystick_moving:
                     self._joystick_moving = False
-                    self._stop_motors()
+                    self._joy_ramper.stop()
 
                 # --- Camera servos: D-pad ---
                 hat_x = axes.get('hat_x', 0.0)
@@ -1169,6 +1312,8 @@ class AutonomousExplorer(Node):
                 while not self._voice_queue.empty():
                     voice_cmd = self._voice_queue.get_nowait()
                     self._process_voice_command(voice_cmd)
+
+                cycle_start = time.time()
 
                 if not self.exploring:
                     time.sleep(0.5)
@@ -1407,7 +1552,7 @@ class AutonomousExplorer(Node):
                     # LLM I/O
                     provider=self.provider_name,
                     model=meta.get('model', ''),
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=active_prompt,
                     user_prompt=user_prompt,
                     image_resolution=f'{img_w}x{img_h}',
                     image_size_bytes=image_size_bytes,
@@ -1437,19 +1582,59 @@ class AutonomousExplorer(Node):
                     voice_command=voice_cmd,
                     speech_output=speech_text,
                     # Exploration memory
-                    total_distance=0.0,  # TODO: integrate odometry distance
+                    total_distance=round(self._total_distance, 3),
                     areas_visited=self.memory.total_actions,
                     objects_discovered=[
                         d['description'][:60]
                         for d in self.memory.discoveries[-20:]
                     ],
-                    map_coverage_pct=0.0,
+                    map_coverage_pct=(
+                        self.nav2.get_map_stats().get('explored_pct', 0.0)
+                        if self.use_nav2 and self.nav2 and self.nav2.has_map
+                        else 0.0
+                    ),
                 )
 
                 # ----------------------------------------------------------
-                # Wait before next cycle
+                # Stuck watchdog: force frontier goal if no progress
                 # ----------------------------------------------------------
-                time.sleep(self.loop_interval)
+                if (self._cycle_count - self._stuck_check_cycle
+                        >= self._stuck_cycles_threshold):
+                    dist_since = self._total_distance - self._stuck_check_distance
+                    if dist_since < self._stuck_distance_threshold:
+                        self.get_logger().warn(
+                            f'Stuck watchdog: only {dist_since:.2f}m in '
+                            f'{self._stuck_cycles_threshold} cycles. '
+                            f'Forcing recovery.'
+                        )
+                        # Try a frontier goal if Nav2 is available
+                        if self.use_nav2 and self.nav2 and self.nav2.has_map:
+                            rx = odom_snapshot.get('x', 0) if odom_snapshot else 0
+                            ry = odom_snapshot.get('y', 0) if odom_snapshot else 0
+                            frontiers = self.nav2.get_frontier_goals(rx, ry)
+                            if frontiers:
+                                f = frontiers[0]
+                                self.get_logger().info(
+                                    f'Stuck recovery: navigating to frontier '
+                                    f'({f["x"]:.1f}, {f["y"]:.1f})'
+                                )
+                                self.nav2.navigate_to(f['x'], f['y'])
+                        else:
+                            # No Nav2: force a spin to break out
+                            self.get_logger().info('Stuck recovery: forced spin')
+                            self._send_twist(0.0, self.max_angular * 0.7)
+                            time.sleep(2.0)
+                            self._stop_motors()
+                    self._stuck_check_distance = self._total_distance
+                    self._stuck_check_cycle = self._cycle_count
+
+                # ----------------------------------------------------------
+                # Wait before next cycle (compensating — subtract elapsed)
+                # ----------------------------------------------------------
+                cycle_elapsed = time.time() - cycle_start
+                remaining = self.loop_interval - cycle_elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
 
             except Exception as e:
                 self.get_logger().error(f'Exploration loop error: {e}')
@@ -1465,7 +1650,9 @@ class AutonomousExplorer(Node):
         self.get_logger().info('Shutting down Autonomous Explorer...')
         self.running = False
         self.exploring = False
-        self._stop_motors()
+        self._emergency_stop_motors()
+        self._ramper.shutdown()
+        self._joy_ramper.shutdown()
         self._center_camera()
         self._joystick.stop()
         self.memory.save()
