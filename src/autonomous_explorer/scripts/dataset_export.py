@@ -129,8 +129,8 @@ def export_csv(records: list[dict], output_path: str):
                 'safety_override_action': safety.get('override_action', ''),
                 # Execution
                 'actual_action': execution.get('actual_action', ''),
-                'motor_left': motors.get('left_speed', 0),
-                'motor_right': motors.get('right_speed', 0),
+                'motor_linear_mps': motors.get('linear_speed_mps', motors.get('left_speed', 0)),
+                'motor_angular_radps': motors.get('angular_speed_radps', motors.get('right_speed', 0)),
                 'servo_pan': servos.get('pan', 0),
                 'servo_tilt': servos.get('tilt', 0),
                 'execution_duration_ms': execution.get('execution_duration_ms', 0),

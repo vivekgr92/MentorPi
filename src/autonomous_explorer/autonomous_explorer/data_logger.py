@@ -264,8 +264,8 @@ class DataLogger:
                 'execution': {
                     'actual_action': actual_action,
                     'motor_commands': {
-                        'left_speed': motor_left_speed,
-                        'right_speed': motor_right_speed,
+                        'linear_speed_mps': motor_left_speed,
+                        'angular_speed_radps': motor_right_speed,
                     },
                     'servo_commands': {
                         'pan': servo_pan,

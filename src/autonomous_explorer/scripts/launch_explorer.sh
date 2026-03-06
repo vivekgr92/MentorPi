@@ -22,6 +22,8 @@ MAX_LINEAR_SPEED="0.20"
 MAX_ANGULAR_SPEED="0.80"
 LAUNCH_HARDWARE="true"
 BUILD_FIRST="false"
+HYBRID_MODE="false"
+FOXGLOVE="true"
 
 # Machine/sensor defaults (override via env or flags)
 : "${MACHINE_TYPE:=MentorPi_Tank}"
@@ -51,6 +53,10 @@ Options:
   --no-voice                   Disable voice I/O
   --no-hardware                Skip launching hardware nodes (camera, LiDAR,
                                controller). Use if they're already running.
+  --no-foxglove                Disable Foxglove Bridge (remote visualization)
+  --foxglove-port <port>       Foxglove Bridge port (default: 8765)
+  --hybrid                     Enable hybrid mode: SLAM + Nav2 + LLM
+                               (requires install_nav2.sh first)
   --build                      Run colcon build before launching
   --help                       Show this help message
 
@@ -74,6 +80,9 @@ Examples:
 
   # Build first, then launch with slower cycle
   ./launch_explorer.sh --build --loop-interval 5.0
+
+  # Launch without remote visualization
+  ./launch_explorer.sh --no-foxglove
 USAGE
     exit 0
 }
@@ -96,6 +105,12 @@ while [[ $# -gt 0 ]]; do
             PROVIDER="dryrun"; VOICE_ENABLED="false"; shift ;;
         --no-hardware)
             LAUNCH_HARDWARE="false"; shift ;;
+        --no-foxglove)
+            FOXGLOVE="false"; shift ;;
+        --foxglove-port)
+            FOXGLOVE_PORT="$2"; shift 2 ;;
+        --hybrid)
+            HYBRID_MODE="true"; LOOP_INTERVAL="5.0"; shift ;;
         --build)
             BUILD_FIRST="true"; shift ;;
         --help|-h)
@@ -183,6 +198,9 @@ echo "  Voice       : $VOICE_ENABLED"
 echo "  Loop interval: ${LOOP_INTERVAL}s"
 echo "  Speed limits : ${MAX_LINEAR_SPEED} m/s, ${MAX_ANGULAR_SPEED} rad/s"
 echo "  Hardware     : $LAUNCH_HARDWARE"
+echo "  Sensor fusion: EKF (odom_raw + IMU → odom)"
+echo "  Foxglove     : $FOXGLOVE (port ${FOXGLOVE_PORT:-8765})"
+echo "  Hybrid (Nav2): $HYBRID_MODE"
 echo "=============================================="
 echo ""
 
@@ -213,19 +231,10 @@ trap cleanup EXIT INT TERM
 # ── Launch hardware nodes ──────────────────────────────────────────────────
 if [[ "$LAUNCH_HARDWARE" == "true" ]]; then
 
-    # --- Device symlinks (STM32 board and LiDAR) ---
-    if [[ -e /dev/ttyACM0 && ! -e /dev/rrc ]]; then
-        echo ">>> Creating symlink: /dev/rrc -> /dev/ttyACM0"
-        sudo ln -sf /dev/ttyACM0 /dev/rrc
-    fi
-    if [[ -e /dev/ttyUSB0 && ! -e /dev/ldlidar ]]; then
-        echo ">>> Creating symlink: /dev/ldlidar -> /dev/ttyUSB0"
-        sudo ln -sf /dev/ttyUSB0 /dev/ldlidar
-    fi
-    if [[ -e /dev/ttyUSB1 && ! -e /dev/wonderecho ]]; then
-        echo ">>> Creating symlink: /dev/wonderecho -> /dev/ttyUSB1"
-        sudo ln -sf /dev/ttyUSB1 /dev/wonderecho
-    fi
+    # --- Auto-detect USB devices and create symlinks ---
+    source "$SCRIPT_DIR/detect_devices.sh"
+    detect_devices
+    create_symlinks
 
     # --- 1. STM32 controller (motors, IMU, battery, servos) ---
     if [[ -e /dev/rrc ]]; then
@@ -244,8 +253,75 @@ if [[ "$LAUNCH_HARDWARE" == "true" ]]; then
     PIDS+=($!)
     sleep 1
 
+    # --- 2b. IMU calibration + complementary filter ---
+    # Pipeline: /ros_robot_controller/imu_raw → imu_calib → imu_corrected → complementary_filter → /imu
+    if [[ -e /dev/rrc ]]; then
+        # Find the IMU calibration file
+        IMU_CALIB_FILE=""
+        if [[ "$need_compile" == "True" ]]; then
+            # Installed workspace — use share directory
+            _CALIB_SHARE="$(ros2 pkg prefix calibration 2>/dev/null)/share/calibration/config/imu_calib.yaml"
+            if [[ -f "$_CALIB_SHARE" ]]; then
+                IMU_CALIB_FILE="$_CALIB_SHARE"
+            fi
+        fi
+        # Fallback: try source tree
+        if [[ -z "$IMU_CALIB_FILE" ]]; then
+            _CALIB_SRC="$WS_ROOT/src/calibration/config/imu_calib.yaml"
+            if [[ -f "$_CALIB_SRC" ]]; then
+                IMU_CALIB_FILE="$_CALIB_SRC"
+            fi
+        fi
+
+        if [[ -n "$IMU_CALIB_FILE" ]]; then
+            echo ">>> Launching IMU calibration (calib file: $IMU_CALIB_FILE)..."
+            ros2 run imu_calib apply_calib --ros-args \
+                -p calib_file:="$IMU_CALIB_FILE" \
+                -r raw:=/ros_robot_controller/imu_raw \
+                -r corrected:=imu_corrected &
+            PIDS+=($!)
+            sleep 1
+
+            echo ">>> Launching IMU complementary filter..."
+            ros2 run imu_complementary_filter complementary_filter_node --ros-args \
+                -p use_mag:=false \
+                -p do_bias_estimation:=true \
+                -p do_adaptive_gain:=true \
+                -r /imu/data_raw:=imu_corrected \
+                -r imu/data:=imu &
+            PIDS+=($!)
+            sleep 1
+        else
+            echo "WARNING: IMU calibration file not found — IMU filter not started."
+            echo "  EKF will run without IMU data (reduced accuracy)."
+        fi
+
+        # --- 2c. EKF sensor fusion (odom_raw + imu → odom) ---
+        echo ">>> Launching EKF sensor fusion..."
+        _EKF_CONFIG=""
+        if [[ "$need_compile" == "True" ]]; then
+            _EKF_SHARE="$(ros2 pkg prefix autonomous_explorer 2>/dev/null)/share/autonomous_explorer/config/ekf.yaml"
+            if [[ -f "$_EKF_SHARE" ]]; then
+                _EKF_CONFIG="$_EKF_SHARE"
+            fi
+        fi
+        if [[ -z "$_EKF_CONFIG" ]]; then
+            _EKF_CONFIG="$WS_ROOT/src/autonomous_explorer/config/ekf.yaml"
+        fi
+
+        ros2 run robot_localization ekf_node --ros-args \
+            --params-file "$_EKF_CONFIG" \
+            -r odometry/filtered:=odom \
+            -r cmd_vel:=controller/cmd_vel &
+        PIDS+=($!)
+        sleep 1
+        echo ">>> Sensor fusion pipeline active: odom_raw + IMU → /odom"
+    else
+        echo "WARNING: STM32 not available — skipping IMU filter and EKF."
+    fi
+
     # --- 3. LiDAR ---
-    if [[ -e /dev/ldlidar || -e /dev/ttyUSB0 ]]; then
+    if [[ -e /dev/ldlidar ]]; then
         echo ">>> Launching LiDAR ($LIDAR_TYPE)..."
         ros2 launch peripherals lidar.launch.py &
         PIDS+=($!)
@@ -269,15 +345,39 @@ if [[ "$LAUNCH_HARDWARE" == "true" ]]; then
     sleep 1
 fi
 
+# ── Launch Foxglove Bridge (remote visualization) ────────────────────────
+if [[ "$FOXGLOVE" == "true" ]]; then
+    _FG_PORT="${FOXGLOVE_PORT:-8765}"
+    if ros2 pkg list 2>/dev/null | grep -q foxglove_bridge; then
+        echo ">>> Launching Foxglove Bridge on port $_FG_PORT..."
+        echo "    Connect from Mac: Open Foxglove → 'Open connection' → ws://$(hostname -I | awk '{print $1}'):$_FG_PORT"
+        ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:="$_FG_PORT" &
+        PIDS+=($!)
+        sleep 1
+    else
+        echo "WARNING: foxglove_bridge not installed — remote visualization disabled."
+        echo "  Install: sudo apt install ros-jazzy-foxglove-bridge"
+    fi
+fi
+
 # ── Launch the explorer ────────────────────────────────────────────────────
-echo ">>> Launching autonomous explorer..."
-ros2 launch autonomous_explorer explorer.launch.py \
-    llm_provider:="$PROVIDER" \
-    loop_interval:="$LOOP_INTERVAL" \
-    voice_enabled:="$VOICE_ENABLED" \
-    max_linear_speed:="$MAX_LINEAR_SPEED" \
-    max_angular_speed:="$MAX_ANGULAR_SPEED" &
-PIDS+=($!)
+if [[ "$HYBRID_MODE" == "true" ]]; then
+    echo ">>> Launching HYBRID explorer (SLAM + Nav2 + LLM)..."
+    ros2 launch autonomous_explorer hybrid_explorer.launch.py \
+        llm_provider:="$PROVIDER" \
+        loop_interval:="$LOOP_INTERVAL" \
+        voice_enabled:="$VOICE_ENABLED" &
+    PIDS+=($!)
+else
+    echo ">>> Launching autonomous explorer (direct mode)..."
+    ros2 launch autonomous_explorer explorer.launch.py \
+        llm_provider:="$PROVIDER" \
+        loop_interval:="$LOOP_INTERVAL" \
+        voice_enabled:="$VOICE_ENABLED" \
+        max_linear_speed:="$MAX_LINEAR_SPEED" \
+        max_angular_speed:="$MAX_ANGULAR_SPEED" &
+    PIDS+=($!)
+fi
 
 echo ""
 echo ">>> Explorer is running! Press Ctrl+C to stop."

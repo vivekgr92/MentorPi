@@ -59,6 +59,7 @@ from autonomous_explorer.config import (
     COST_PER_M_INPUT_TOKENS,
     COST_PER_M_OUTPUT_TOKENS,
     EMERGENCY_STOP_DISTANCE,
+    HYBRID_SYSTEM_PROMPT,
     IMU_TOPIC,
     LIDAR_MAX_SCAN_ANGLE,
     LIDAR_TOPIC,
@@ -75,6 +76,7 @@ from autonomous_explorer.config import (
     MAX_LINEAR_SPEED,
     MEMORY_FILE,
     MOTOR_TIMEOUT,
+    NAV2_GOAL_TIMEOUT,
     ODOM_TOPIC,
     OPENAI_API_KEY,
     OPENAI_MODEL,
@@ -92,9 +94,11 @@ from autonomous_explorer.config import (
     SYSTEM_PROMPT,
     TTS_MODEL,
     TTS_VOICE,
+    USE_NAV2,
     VOICE_ENABLED,
     WONDERECHO_PORT,
 )
+from autonomous_explorer.nav2_bridge import NAV2_AVAILABLE
 from autonomous_explorer.data_logger import DataLogger
 from autonomous_explorer.exploration_memory import ExplorationMemory
 from autonomous_explorer.joystick_reader import JoystickReader
@@ -123,6 +127,7 @@ class AutonomousExplorer(Node):
         self.declare_parameter('max_linear_speed', MAX_LINEAR_SPEED)
         self.declare_parameter('max_angular_speed', MAX_ANGULAR_SPEED)
         self.declare_parameter('voice_enabled', VOICE_ENABLED)
+        self.declare_parameter('use_nav2', USE_NAV2)
 
         # Read parameters
         self.provider_name = self.get_parameter(
@@ -147,6 +152,26 @@ class AutonomousExplorer(Node):
             'max_angular_speed').get_parameter_value().double_value
         self.voice_on = self.get_parameter(
             'voice_enabled').get_parameter_value().bool_value
+        self.use_nav2 = self.get_parameter(
+            'use_nav2').get_parameter_value().bool_value
+
+        # ------------------------------------------------------------------
+        # Nav2 hybrid mode
+        # ------------------------------------------------------------------
+        self.nav2 = None
+        if self.use_nav2:
+            if NAV2_AVAILABLE:
+                from autonomous_explorer.nav2_bridge import Nav2Bridge
+                self.nav2 = Nav2Bridge(self)
+                self.get_logger().info(
+                    'HYBRID MODE: Nav2 + SLAM + LLM enabled'
+                )
+            else:
+                self.get_logger().warn(
+                    'use_nav2=True but nav2_msgs not installed. '
+                    'Falling back to direct motor control.'
+                )
+                self.use_nav2 = False
 
         # ------------------------------------------------------------------
         # State
@@ -782,6 +807,48 @@ class AutonomousExplorer(Node):
             'override_action': cmd,
         }
 
+        # Handle Nav2 navigate action (hybrid mode)
+        if cmd == 'navigate' and self.use_nav2 and self.nav2:
+            goal_x = float(action.get('goal_x', 0.0))
+            goal_y = float(action.get('goal_y', 0.0))
+            self.get_logger().info(
+                f'Nav2 navigate to ({goal_x:.2f}, {goal_y:.2f})'
+            )
+            accepted = self.nav2.navigate_to(goal_x, goal_y)
+            if not accepted:
+                safety['triggered'] = True
+                safety['reason'] = 'Nav2 goal not accepted'
+                safety['override_action'] = 'stop'
+                return safety
+
+            # Wait for navigation to complete (with timeout)
+            t_start = time.time()
+            while (self.nav2.is_navigating
+                   and self.running
+                   and time.time() - t_start < NAV2_GOAL_TIMEOUT):
+                if self.emergency_stop:
+                    self.nav2.cancel_navigation()
+                    self._stop_motors()
+                    safety['triggered'] = True
+                    safety['reason'] = 'emergency stop during navigation'
+                    safety['override_action'] = 'stop'
+                    return safety
+                time.sleep(0.2)
+
+            result = self.nav2.navigation_result
+            if result == 'succeeded':
+                self.get_logger().info('Nav2 goal reached')
+            elif result == 'failed':
+                self.get_logger().warn('Nav2 navigation failed')
+                safety['triggered'] = True
+                safety['reason'] = 'Nav2 navigation failed'
+            elif result is None:
+                self.get_logger().warn('Nav2 navigation timed out')
+                self.nav2.cancel_navigation()
+                safety['triggered'] = True
+                safety['reason'] = 'Nav2 navigation timeout'
+            return safety
+
         # Clamp duration for safety
         duration = min(duration, 5.0)
         # Scale speed to actual velocity limits
@@ -1159,15 +1226,76 @@ class AutonomousExplorer(Node):
                         f'yaw={math.degrees(ori.get("yaw", 0)):.1f}°'
                     )
 
+                # Build hybrid-mode extras (map image, frontier goals)
+                map_summary = ''
+                map_b64 = None
+                frontier_summary = ''
+                if self.use_nav2 and self.nav2 and self.nav2.has_map:
+                    # Render bird's-eye map image
+                    rx = odom_snapshot.get('x', 0) if odom_snapshot else 0
+                    ry = odom_snapshot.get('y', 0) if odom_snapshot else 0
+                    rt = odom_snapshot.get('theta', 0) if odom_snapshot else 0
+                    map_img = self.nav2.render_map_image(rx, ry, rt)
+                    if map_img is not None:
+                        _, map_jpg = cv2.imencode(
+                            '.jpg', map_img,
+                            [cv2.IMWRITE_JPEG_QUALITY, 80],
+                        )
+                        map_b64 = base64.b64encode(
+                            map_jpg.tobytes()
+                        ).decode('utf-8')
+
+                    # Map stats
+                    ms = self.nav2.get_map_stats()
+                    if ms:
+                        map_summary = (
+                            f'MAP: {ms.get("explored_pct", 0)}% explored, '
+                            f'{ms.get("area_m2", 0)}m² mapped, '
+                            f'{ms.get("free_cells", 0)} free / '
+                            f'{ms.get("occupied_cells", 0)} walls / '
+                            f'{ms.get("unknown_cells", 0)} unknown cells'
+                        )
+
+                    # Frontier goals
+                    frontiers = self.nav2.get_frontier_goals(rx, ry)
+                    if frontiers:
+                        parts = []
+                        for i, f in enumerate(frontiers[:5]):
+                            parts.append(
+                                f'  F{i+1}: ({f["x"]:.2f},{f["y"]:.2f}) '
+                                f'dist={f["distance"]:.1f}m size={f["size"]}'
+                            )
+                        frontier_summary = (
+                            'FRONTIER GOALS (unexplored boundaries):\n'
+                            + '\n'.join(parts)
+                        )
+
+                # Select system prompt based on mode
+                active_prompt = (
+                    HYBRID_SYSTEM_PROMPT if self.use_nav2
+                    else SYSTEM_PROMPT
+                )
+
                 user_prompt = (
                     f'Current sensor data:\n'
                     f'{lidar_summary}\n'
                     f'{depth_summary}\n'
                     f'{odom_summary}\n'
                     f'{imu_summary}\n'
+                )
+                if map_summary:
+                    user_prompt += f'{map_summary}\n'
+                if frontier_summary:
+                    user_prompt += f'{frontier_summary}\n'
+                user_prompt += (
                     f'\nExploration context:\n{memory_context}\n'
-                    f'\nAnalyze the camera image and ALL sensor data. '
-                    f'Decide your next action. Respond in JSON only.'
+                    f'\nAnalyze the camera image'
+                )
+                if map_b64:
+                    user_prompt += ' and the bird\'s-eye map'
+                user_prompt += (
+                    ' and ALL sensor data. '
+                    'Decide your next action. Respond in JSON only.'
                 )
 
                 # Image metadata for logging
@@ -1181,8 +1309,14 @@ class AutonomousExplorer(Node):
                 self.get_logger().info(
                     f'Calling {self.provider_name} for scene analysis...'
                 )
+
+                # In hybrid mode, send map image as second image
+                images = [image_b64]
+                if map_b64:
+                    images.append(map_b64)
+
                 result = self.llm.analyze_scene(
-                    image_b64, SYSTEM_PROMPT, user_prompt,
+                    images, active_prompt, user_prompt,
                 )
 
                 # Extract metadata from provider
@@ -1337,6 +1471,9 @@ class AutonomousExplorer(Node):
         self.memory.save()
         self.data_logger.stop()
         self.wake_detector.stop()
+        if self.nav2:
+            self.nav2.cancel_navigation()
+            self.nav2.destroy()
         if self.voice_on:
             self.voice.speak('Exploration complete. Shutting down.', block=True)
         self.get_logger().info('Shutdown complete.')

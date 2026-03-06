@@ -27,14 +27,15 @@ class LLMProvider(ABC):
     @abstractmethod
     def analyze_scene(
         self,
-        image_base64: str,
+        image_base64: 'str | list[str]',
         system_prompt: str,
         user_prompt: str,
     ) -> dict:
-        """Send an image + prompt to the LLM and return a parsed JSON dict.
+        """Send image(s) + prompt to the LLM and return a parsed JSON dict.
 
         Args:
-            image_base64: JPEG image encoded as base64 string.
+            image_base64: Single JPEG base64 string, or list of base64 strings
+                (e.g. [camera_image, map_image] for hybrid mode).
             system_prompt: The robot brain system prompt.
             user_prompt: Sensor context and instructions for this frame.
 
@@ -126,33 +127,34 @@ class ClaudeProvider(LLMProvider):
 
     def analyze_scene(
         self,
-        image_base64: str,
+        image_base64: 'str | list[str]',
         system_prompt: str,
         user_prompt: str,
     ) -> dict:
         t_start = time.monotonic()
+        # Normalize to list
+        images = image_base64 if isinstance(image_base64, list) else [image_base64]
         try:
+            content = []
+            for img in images:
+                content.append({
+                    'type': 'image',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': 'image/jpeg',
+                        'data': img,
+                    },
+                })
+            content.append({
+                'type': 'text',
+                'text': user_prompt,
+            })
+
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=512,
                 system=system_prompt,
-                messages=[{
-                    'role': 'user',
-                    'content': [
-                        {
-                            'type': 'image',
-                            'source': {
-                                'type': 'base64',
-                                'media_type': 'image/jpeg',
-                                'data': image_base64,
-                            },
-                        },
-                        {
-                            'type': 'text',
-                            'text': user_prompt,
-                        },
-                    ],
-                }],
+                messages=[{'role': 'user', 'content': content}],
             )
             elapsed_ms = int((time.monotonic() - t_start) * 1000)
             raw_text = response.content[0].text
@@ -184,32 +186,33 @@ class OpenAIProvider(LLMProvider):
 
     def analyze_scene(
         self,
-        image_base64: str,
+        image_base64: 'str | list[str]',
         system_prompt: str,
         user_prompt: str,
     ) -> dict:
         t_start = time.monotonic()
+        # Normalize to list
+        images = image_base64 if isinstance(image_base64, list) else [image_base64]
         try:
+            content = []
+            for img in images:
+                content.append({
+                    'type': 'image_url',
+                    'image_url': {
+                        'url': f'data:image/jpeg;base64,{img}',
+                    },
+                })
+            content.append({
+                'type': 'text',
+                'text': user_prompt,
+            })
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=512,
                 messages=[
                     {'role': 'system', 'content': system_prompt},
-                    {
-                        'role': 'user',
-                        'content': [
-                            {
-                                'type': 'image_url',
-                                'image_url': {
-                                    'url': f'data:image/jpeg;base64,{image_base64}',
-                                },
-                            },
-                            {
-                                'type': 'text',
-                                'text': user_prompt,
-                            },
-                        ],
-                    },
+                    {'role': 'user', 'content': content},
                 ],
                 response_format={'type': 'json_object'},
             )
@@ -269,7 +272,7 @@ class DryRunProvider(LLMProvider):
 
     def analyze_scene(
         self,
-        image_base64: str,
+        image_base64: 'str | list[str]',
         system_prompt: str,
         user_prompt: str,
     ) -> dict:
