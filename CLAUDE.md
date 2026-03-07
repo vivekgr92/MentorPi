@@ -138,11 +138,11 @@ src/autonomous_explorer/
 ├── autonomous_explorer/
 │   ├── config.py              # All config: env vars, topics, safety thresholds, servo IDs, logging
 │   ├── llm_provider.py        # Provider abstraction with token usage tracking (_meta dict)
-│   ├── explorer_node.py       # Main ROS2 node: exploration loop, joystick, logging, IMU/odom/battery subs
+│   ├── explorer_node.py       # Main ROS2 node: modular __init__ (9 helpers), voice dispatch table, LLM dashboard dataclass
 │   ├── joystick_reader.py     # Pygame joystick reader (daemon thread, 50Hz, SHANWAN/WirelessGamepad)
 │   ├── data_logger.py         # Async JSONL logger: background thread, frame saving, compression
 │   ├── voice_io.py            # VoiceIO (arecord + Whisper STT + OpenAI TTS), WonderEchoDetector
-│   └── exploration_memory.py  # Rolling action log, discovery tracker, stuck detection
+│   └── exploration_memory.py  # Rolling action log, discovery tracker, stuck detection, shared speech_contains_discovery()
 ├── scripts/
 │   ├── analytics_dashboard.py # Post-session analysis: charts, stats, path map, provider comparison
 │   └── dataset_export.py      # Export to CSV, imitation learning pairs, HuggingFace format

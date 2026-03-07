@@ -14,6 +14,18 @@ import os
 import time
 from collections import deque
 
+# Shared discovery keyword detection — avoids duplication across modules
+DISCOVERY_KEYWORDS = (
+    'see', 'found', 'notice', 'spot', 'discover',
+    'interesting', 'detect', 'observe',
+)
+
+
+def speech_contains_discovery(speech: str) -> bool:
+    """Check whether speech text mentions a discovery."""
+    lower = speech.lower()
+    return any(kw in lower for kw in DISCOVERY_KEYWORDS)
+
 
 # Spatial map grid resolution in meters
 _GRID_CELL = 0.25
@@ -131,12 +143,7 @@ class ExplorationMemory:
         self.movement_history.append(entry['action'])
 
         # Auto-detect discoveries from speech content
-        speech = entry['speech'].lower()
-        discovery_keywords = [
-            'see', 'found', 'notice', 'spot', 'discover',
-            'interesting', 'detect', 'observe',
-        ]
-        if any(kw in speech for kw in discovery_keywords):
+        if speech_contains_discovery(entry['speech']):
             disc = {
                 'time': entry['time'],
                 'description': entry['speech'],

@@ -29,22 +29,22 @@ import signal
 import sys
 import threading
 import time
+import traceback
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
-from std_msgs.msg import String, UInt16
+from std_msgs.msg import Bool, String, UInt16
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
-from sensor_msgs.msg import Image, LaserScan
-
+from sensor_msgs.msg import Image, Imu, LaserScan
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
 
 from autonomous_explorer.config import (
     ANGULAR_ACCEL,
@@ -123,6 +123,69 @@ from autonomous_explorer.velocity_ramper import VelocityRamper
 from autonomous_explorer.voice_io import VoiceIO, WonderEchoDetector
 
 
+def _quaternion_to_yaw(q) -> float:
+    """Extract yaw angle from a quaternion (ROS convention).
+
+    Works with any object that has .w, .x, .y, .z attributes
+    (geometry_msgs Quaternion, sensor_msgs Imu orientation, etc.).
+    """
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
+def _quaternion_to_euler(q) -> tuple[float, float, float]:
+    """Extract (roll, pitch, yaw) from a quaternion."""
+    sinr = 2.0 * (q.w * q.x + q.y * q.z)
+    cosr = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    roll = math.atan2(sinr, cosr)
+
+    sinp = 2.0 * (q.w * q.y - q.z * q.x)
+    pitch = math.asin(max(-1.0, min(1.0, sinp)))
+
+    yaw = _quaternion_to_yaw(q)
+    return roll, pitch, yaw
+
+
+@dataclass
+class _LLMDashboardState:
+    """Snapshot of latest LLM result for the status dashboard.
+
+    Grouped into a dataclass to replace 12+ individual instance variables,
+    making _publish_status and _update_dashboard_state cleaner.
+    """
+
+    action: str = ''
+    speed: float = 0.0
+    duration: float = 0.0
+    reasoning: str = ''
+    speech: str = ''
+    response_ms: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost: float = 0.0
+    timestamp: float = 0.0
+    safety_triggered: bool = False
+    safety_reason: str = ''
+
+    def to_dict(self) -> dict:
+        """Serialize for JSON status publishing."""
+        return {
+            'action': self.action,
+            'speed': self.speed,
+            'duration': self.duration,
+            'reasoning': self.reasoning,
+            'speech': self.speech,
+            'response_ms': self.response_ms,
+            'tokens_in': self.tokens_in,
+            'tokens_out': self.tokens_out,
+            'cost': self.cost,
+            'timestamp': self.timestamp,
+            'safety_triggered': self.safety_triggered,
+            'safety_reason': self.safety_reason,
+        }
+
+
 class AutonomousExplorer(Node):
     """Main ROS2 node for autonomous LLM-driven exploration."""
 
@@ -130,9 +193,33 @@ class AutonomousExplorer(Node):
         super().__init__('autonomous_explorer')
         self.get_logger().info('Initializing Autonomous Explorer...')
 
-        # ------------------------------------------------------------------
-        # Declare ROS2 parameters (overridable via launch file / CLI)
-        # ------------------------------------------------------------------
+        self._declare_and_read_parameters()
+        self._init_nav2()
+        self._init_state()
+        self._init_joystick()
+        self._init_llm_provider()
+        self._init_subsystems()
+        self._init_publishers_and_rampers()
+        self._init_subscribers()
+        self._init_timers_and_threads()
+
+        # Speak session intro greeting
+        intro = self.consciousness.get_session_intro()
+        self.get_logger().info(f'Jeeves: {intro}')
+        if self.voice_on:
+            self.voice.speak(intro)
+
+        self.get_logger().info(
+            'Autonomous Explorer ready. '
+            'Say "start exploring" or press Enter in terminal to begin.'
+        )
+
+    # ------------------------------------------------------------------
+    # Initialization helpers (called only from __init__)
+    # ------------------------------------------------------------------
+
+    def _declare_and_read_parameters(self):
+        """Declare ROS2 parameters and read their values."""
         self.declare_parameter('llm_provider', LLM_PROVIDER)
         self.declare_parameter('anthropic_api_key', ANTHROPIC_API_KEY)
         self.declare_parameter('openai_api_key', OPENAI_API_KEY)
@@ -146,35 +233,30 @@ class AutonomousExplorer(Node):
         self.declare_parameter('voice_enabled', VOICE_ENABLED)
         self.declare_parameter('use_nav2', USE_NAV2)
 
-        # Read parameters
-        self.provider_name = self.get_parameter(
-            'llm_provider').get_parameter_value().string_value
-        self.anthropic_key = self.get_parameter(
-            'anthropic_api_key').get_parameter_value().string_value
-        self.openai_key = self.get_parameter(
-            'openai_api_key').get_parameter_value().string_value
-        self.claude_model = self.get_parameter(
-            'claude_model').get_parameter_value().string_value
-        self.openai_model = self.get_parameter(
-            'openai_model').get_parameter_value().string_value
-        self.loop_interval = self.get_parameter(
-            'loop_interval').get_parameter_value().double_value
-        self.e_stop_dist = self.get_parameter(
-            'emergency_stop_distance').get_parameter_value().double_value
-        self.caution_dist = self.get_parameter(
-            'caution_distance').get_parameter_value().double_value
-        self.max_linear = self.get_parameter(
-            'max_linear_speed').get_parameter_value().double_value
-        self.max_angular = self.get_parameter(
-            'max_angular_speed').get_parameter_value().double_value
-        self.voice_on = self.get_parameter(
-            'voice_enabled').get_parameter_value().bool_value
-        self.use_nav2 = self.get_parameter(
-            'use_nav2').get_parameter_value().bool_value
+        def _get_str(name: str) -> str:
+            return self.get_parameter(name).get_parameter_value().string_value
 
-        # ------------------------------------------------------------------
-        # Nav2 hybrid mode
-        # ------------------------------------------------------------------
+        def _get_float(name: str) -> float:
+            return self.get_parameter(name).get_parameter_value().double_value
+
+        def _get_bool(name: str) -> bool:
+            return self.get_parameter(name).get_parameter_value().bool_value
+
+        self.provider_name = _get_str('llm_provider')
+        self.anthropic_key = _get_str('anthropic_api_key')
+        self.openai_key = _get_str('openai_api_key')
+        self.claude_model = _get_str('claude_model')
+        self.openai_model = _get_str('openai_model')
+        self.loop_interval = _get_float('loop_interval')
+        self.e_stop_dist = _get_float('emergency_stop_distance')
+        self.caution_dist = _get_float('caution_distance')
+        self.max_linear = _get_float('max_linear_speed')
+        self.max_angular = _get_float('max_angular_speed')
+        self.voice_on = _get_bool('voice_enabled')
+        self.use_nav2 = _get_bool('use_nav2')
+
+    def _init_nav2(self):
+        """Initialize Nav2 hybrid mode if requested and available."""
         self.nav2 = None
         if self.use_nav2:
             if NAV2_AVAILABLE:
@@ -190,96 +272,80 @@ class AutonomousExplorer(Node):
                 )
                 self.use_nav2 = False
 
-        # ------------------------------------------------------------------
-        # State
-        # ------------------------------------------------------------------
+    def _init_state(self):
+        """Initialize all runtime state variables."""
         self.bridge = CvBridge()
         self.running = True
-        self.exploring = False  # Start paused — user must say go or press Enter
+        self.exploring = False
         self.emergency_stop = False
 
-        # Latest sensor data (thread-safe via locks)
+        # Sensor data (thread-safe via locks)
         self._rgb_lock = threading.Lock()
-        self._rgb_image = None  # numpy BGR
+        self._rgb_image = None
 
         self._depth_lock = threading.Lock()
-        self._depth_image = None  # numpy uint16 (mm)
+        self._depth_image = None
 
         self._lidar_lock = threading.Lock()
-        self._lidar_ranges = None  # dict with front/left/right/back min distances
-        self._lidar_raw = None  # raw LaserScan for detailed analysis
+        self._lidar_ranges = None
+        self._lidar_raw = None
 
         self._imu_lock = threading.Lock()
-        self._imu_data = None  # dict with orientation, accel, gyro
+        self._imu_data = None
 
         self._odom_lock = threading.Lock()
-        self._odom_data = None  # dict with position {x, y, theta}
+        self._odom_data = None
 
-        self._battery_voltage = None  # float or None
+        self._battery_voltage = None
 
-        # Track last twist and servo commands for logging
-        self._last_twist = (0.0, 0.0)  # (linear_x, angular_z)
+        # Motor/servo tracking
+        self._last_twist = (0.0, 0.0)
         self._last_servo_pan = SERVO_CENTER
         self._last_servo_tilt = SERVO_CENTER
 
         # Odometry-based distance tracking + stuck detection
-        self._total_distance = 0.0      # cumulative meters traveled
+        self._total_distance = 0.0
         self._prev_odom_x = None
         self._prev_odom_y = None
-        self._stuck_check_distance = 0.0  # distance at last stuck check
-        self._stuck_check_cycle = 0       # cycle at last stuck check
-        self._stuck_cycles_threshold = 8  # check every N cycles
-        self._stuck_distance_threshold = 0.3  # must move at least this far
-        # Latest voice command text (consumed per cycle)
-        self._last_voice_cmd = None
+        self._prev_cycle_odom_x = None
+        self._prev_cycle_odom_y = None
+        self._stuck_check_distance = 0.0
+        self._stuck_check_cycle = 0
+        self._stuck_cycles_threshold = 8
+        self._stuck_distance_threshold = 0.3
 
+        self._last_voice_cmd = None
         self._last_command_time = time.time()
 
-        # LLM state tracking (for status dashboard)
+        # Dashboard state
         self._llm_lock = threading.Lock()
-        self._last_llm_action = ''
-        self._last_llm_speed = 0.0
-        self._last_llm_duration = 0.0
-        self._last_llm_reasoning = ''
-        self._last_llm_speech = ''
-        self._last_llm_response_ms = 0
-        self._last_llm_tokens_in = 0
-        self._last_llm_tokens_out = 0
-        self._last_llm_cost = 0.0
-        self._last_llm_time = 0.0  # time.time() of last LLM result
-        self._last_safety_triggered = False
-        self._last_safety_reason = ''
+        self._llm_state = _LLMDashboardState()
 
-        # Session-level counters
+        # Session counters
         self._cycle_count = 0
         self._session_total_cost = 0.0
         self._session_start_time = time.time()
 
-        # Voice command queue (from wake word + STT)
+        # Voice command queue
         self._voice_queue: queue.Queue = queue.Queue(maxsize=5)
 
-        # ------------------------------------------------------------------
-        # Control mode: "autonomous" (LLM-driven) or "manual" (joystick)
-        # ------------------------------------------------------------------
+    def _init_joystick(self):
+        """Initialize joystick reader and manual control state."""
         self.control_mode = 'autonomous'
 
-        # Joystick reader (daemon thread)
         self._joystick = JoystickReader(
             on_button_press=self._joystick_button_callback,
             logger=self.get_logger(),
         )
         self._joystick.start()
 
-        # Camera servo positions for D-pad control (start centered)
         self._manual_pan = SERVO_CENTER
         self._manual_tilt = SERVO_CENTER
-        _SERVO_STEP = 100  # microseconds per D-pad press tick
-        self._servo_step = _SERVO_STEP
+        self._servo_step = 100  # microseconds per D-pad tick
         self._joystick_moving = False
 
-        # ------------------------------------------------------------------
-        # Initialize LLM provider (auto-fallback to dry-run if no API key)
-        # ------------------------------------------------------------------
+    def _init_llm_provider(self):
+        """Create the LLM provider, falling back to dry-run if no key."""
         if self.provider_name in ('dryrun', 'dry-run', 'dry_run'):
             api_key = ''
             model = 'dry-run'
@@ -308,14 +374,10 @@ class AutonomousExplorer(Node):
             f'LLM provider: {self.provider_name} ({model})'
         )
 
-        # ------------------------------------------------------------------
-        # Initialize exploration memory
-        # ------------------------------------------------------------------
+    def _init_subsystems(self):
+        """Initialize memory, voice, data logger, consciousness, knowledge."""
         self.memory = ExplorationMemory(MEMORY_FILE)
 
-        # ------------------------------------------------------------------
-        # Initialize voice I/O
-        # ------------------------------------------------------------------
         self.voice = VoiceIO(
             openai_api_key=self.openai_key,
             tts_model=TTS_MODEL,
@@ -330,9 +392,6 @@ class AutonomousExplorer(Node):
         if self.voice_on:
             self.wake_detector.start()
 
-        # ------------------------------------------------------------------
-        # Initialize data logger
-        # ------------------------------------------------------------------
         self.data_logger = DataLogger(
             log_dir=LOG_DIR,
             log_level=LOG_LEVEL,
@@ -344,9 +403,6 @@ class AutonomousExplorer(Node):
         )
         self.data_logger.start()
 
-        # ------------------------------------------------------------------
-        # Consciousness layer (persistent identity + reflections)
-        # ------------------------------------------------------------------
         self.consciousness = JeevesConsciousness(
             stats_dir=CONSCIOUSNESS_DIR,
             birthday=JEEVES_BIRTHDAY,
@@ -354,40 +410,30 @@ class AutonomousExplorer(Node):
             logger=self.get_logger(),
         )
 
-        # ------------------------------------------------------------------
-        # World knowledge (persistent rooms, objects, behaviors)
-        # ------------------------------------------------------------------
         self.world_knowledge = WorldKnowledge(
             knowledge_dir=KNOWLEDGE_DIR,
             logger=self.get_logger(),
         )
 
-        # ------------------------------------------------------------------
-        # ROS2 publishers + velocity ramper
-        # ------------------------------------------------------------------
+    def _init_publishers_and_rampers(self):
+        """Set up ROS2 publishers and velocity rampers."""
         self.use_twist_mux = USE_TWIST_MUX
 
         if self.use_twist_mux:
-            # twist_mux mode: separate topics per source, mux outputs to CMD_VEL
             self._auto_pub = self.create_publisher(
                 Twist, TWIST_MUX_AUTONOMOUS_TOPIC, 1)
             self._joy_pub = self.create_publisher(
                 Twist, TWIST_MUX_JOYSTICK_TOPIC, 1)
-            from std_msgs.msg import Bool
             self._estop_lock_pub = self.create_publisher(
                 Bool, TWIST_MUX_LOCK_TOPIC, 1)
-            # Default motor output goes through autonomous topic
             self.cmd_vel_pub = self._auto_pub
         else:
-            # Direct mode: everything publishes to the same CMD_VEL topic
             self.cmd_vel_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 1)
             self._auto_pub = self.cmd_vel_pub
             self._joy_pub = self.cmd_vel_pub
             self._estop_lock_pub = None
 
-        # Velocity ramper: smooths step commands into trapezoidal profiles
-        self._ramper = VelocityRamper(
-            publisher=self._auto_pub,
+        ramper_kwargs = dict(
             max_linear=self.max_linear,
             max_angular=self.max_angular,
             linear_accel=LINEAR_ACCEL,
@@ -397,29 +443,19 @@ class AutonomousExplorer(Node):
             update_rate=RAMPER_UPDATE_RATE,
             logger=self.get_logger(),
         )
+
+        self._ramper = VelocityRamper(publisher=self._auto_pub, **ramper_kwargs)
         self._ramper.start()
 
-        # Joystick ramper (separate instance for independent control)
-        self._joy_ramper = VelocityRamper(
-            publisher=self._joy_pub,
-            max_linear=self.max_linear,
-            max_angular=self.max_angular,
-            linear_accel=LINEAR_ACCEL,
-            linear_decel=LINEAR_DECEL,
-            angular_accel=ANGULAR_ACCEL,
-            angular_decel=ANGULAR_DECEL,
-            update_rate=RAMPER_UPDATE_RATE,
-            logger=self.get_logger(),
-        )
+        self._joy_ramper = VelocityRamper(publisher=self._joy_pub, **ramper_kwargs)
         self._joy_ramper.start()
 
         self.servo_pub = self.create_publisher(
             SetPWMServoState, SERVO_TOPIC, 1,
         )
 
-        # ------------------------------------------------------------------
-        # ROS2 subscribers
-        # ------------------------------------------------------------------
+    def _init_subscribers(self):
+        """Set up all ROS2 sensor and command subscribers."""
         cb_group = ReentrantCallbackGroup()
 
         self.create_subscription(
@@ -457,27 +493,21 @@ class AutonomousExplorer(Node):
             callback_group=cb_group,
         )
 
-        # ------------------------------------------------------------------
-        # Status publisher (for real-time dashboard)
-        # ------------------------------------------------------------------
+        # Status publisher and command subscriber
         self.status_pub = self.create_publisher(String, STATUS_TOPIC, 1)
         self.create_subscription(
             String, '/explorer/command',
             self._command_callback, 1,
             callback_group=cb_group,
         )
+
+    def _init_timers_and_threads(self):
+        """Set up ROS2 timers and background threads."""
         self.create_timer(
             1.0 / STATUS_PUBLISH_RATE, self._publish_status,
         )
-
-        # ------------------------------------------------------------------
-        # Motor timeout safety timer
-        # ------------------------------------------------------------------
         self.create_timer(1.0, self._motor_timeout_check)
 
-        # ------------------------------------------------------------------
-        # Start background threads
-        # ------------------------------------------------------------------
         self._explore_thread = threading.Thread(
             target=self._exploration_loop, daemon=True,
         )
@@ -493,17 +523,6 @@ class AutonomousExplorer(Node):
                 target=self._voice_listener_loop, daemon=True,
             )
             self._voice_thread.start()
-
-        # Speak session intro greeting
-        intro = self.consciousness.get_session_intro()
-        self.get_logger().info(f'Jeeves: {intro}')
-        if self.voice_on:
-            self.voice.speak(intro)
-
-        self.get_logger().info(
-            'Autonomous Explorer ready. '
-            'Say "start exploring" or press Enter in terminal to begin.'
-        )
 
     # ======================================================================
     # ROS2 Callbacks
@@ -580,29 +599,36 @@ class AutonomousExplorer(Node):
             self._lidar_ranges = sectors
             self._lidar_raw = msg
 
-        # Emergency stop check — direction-aware
-        # Check sectors relevant to current motion direction
+        # Safety evaluation runs on every scan (~10Hz)
+        self._evaluate_lidar_safety(sectors)
+
+    def _evaluate_lidar_safety(self, sectors: dict):
+        """Direction-aware emergency stop evaluation.
+
+        Checks sectors relevant to current motion direction and triggers
+        or clears emergency stop with hysteresis.
+
+        Separated from _lidar_callback for testability and single
+        responsibility (sensor processing vs safety logic).
+        """
         cur_lin, cur_ang = self._ramper.current_velocity
         threat_dist = float('inf')
         threat_sector = ''
 
         if cur_lin > 0.01:
-            # Moving forward: check front
             threat_dist = sectors['front']
             threat_sector = 'front'
         elif cur_lin < -0.01:
-            # Moving backward: check back
             threat_dist = sectors['back']
             threat_sector = 'back'
 
         if abs(cur_ang) > 0.1:
-            # Spinning: check the side we're turning toward
             side = 'left' if cur_ang > 0 else 'right'
             if sectors[side] < threat_dist:
                 threat_dist = sectors[side]
                 threat_sector = side
 
-        # Also always check front (even when stationary, for safety)
+        # Always check front even when stationary
         if sectors['front'] < threat_dist:
             threat_dist = sectors['front']
             threat_sector = 'front'
@@ -610,32 +636,23 @@ class AutonomousExplorer(Node):
         if threat_dist < self.e_stop_dist:
             if not self.emergency_stop:
                 self.get_logger().warn(
-                    f"EMERGENCY STOP! Obstacle {threat_sector} at {threat_dist:.2f}m"
+                    f'EMERGENCY STOP! Obstacle {threat_sector} '
+                    f'at {threat_dist:.2f}m'
                 )
                 self.emergency_stop = True
                 self._emergency_stop_motors()
-        elif self.emergency_stop and sectors.get('overall', float('inf')) > self.e_stop_dist * 2.0:
-            # Clear when ALL directions have more clearance (wider hysteresis)
+        elif (self.emergency_stop
+              and sectors.get('overall', float('inf')) > self.e_stop_dist * 2.0):
             self.get_logger().info('Surroundings cleared, resuming...')
             self.emergency_stop = False
             if self._estop_lock_pub:
-                from std_msgs.msg import Bool
-                msg = Bool()
-                msg.data = False
-                self._estop_lock_pub.publish(msg)
+                lock_msg = Bool()
+                lock_msg.data = False
+                self._estop_lock_pub.publish(lock_msg)
 
     def _imu_callback(self, msg: Imu):
         """Store latest IMU reading."""
-        q = msg.orientation
-        # Convert quaternion to Euler (simplified roll/pitch/yaw)
-        sinr = 2.0 * (q.w * q.x + q.y * q.z)
-        cosr = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
-        roll = math.atan2(sinr, cosr)
-        sinp = 2.0 * (q.w * q.y - q.z * q.x)
-        pitch = math.asin(max(-1.0, min(1.0, sinp)))
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        yaw = math.atan2(siny, cosy)
+        roll, pitch, yaw = _quaternion_to_euler(msg.orientation)
 
         data = {
             'orientation': {
@@ -660,10 +677,7 @@ class AutonomousExplorer(Node):
     def _odom_callback(self, msg: Odometry):
         """Store latest odometry reading and accumulate distance traveled."""
         pos = msg.pose.pose.position
-        q = msg.pose.pose.orientation
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        theta = math.atan2(siny, cosy)
+        theta = _quaternion_to_yaw(msg.pose.pose.orientation)
 
         # Accumulate distance
         if self._prev_odom_x is not None:
@@ -695,20 +709,7 @@ class AutonomousExplorer(Node):
         with self._odom_lock:
             odom = self._odom_data.copy() if self._odom_data else None
         with self._llm_lock:
-            llm = {
-                'action': self._last_llm_action,
-                'speed': self._last_llm_speed,
-                'duration': self._last_llm_duration,
-                'reasoning': self._last_llm_reasoning,
-                'speech': self._last_llm_speech,
-                'response_ms': self._last_llm_response_ms,
-                'tokens_in': self._last_llm_tokens_in,
-                'tokens_out': self._last_llm_tokens_out,
-                'cost': self._last_llm_cost,
-                'timestamp': self._last_llm_time,
-                'safety_triggered': self._last_safety_triggered,
-                'safety_reason': self._last_safety_reason,
-            }
+            llm = self._llm_state.to_dict()
 
         uptime = time.time() - self._session_start_time
 
@@ -790,22 +791,24 @@ class AutonomousExplorer(Node):
 
     def _send_twist(self, linear_x: float, angular_z: float):
         """Set target velocity — ramper smoothly approaches it."""
-        if self.emergency_stop and linear_x > 0:
-            self.get_logger().warn('Emergency stop active — blocking forward')
-            linear_x = 0.0
-            angular_z = 0.0
-
-        self._ramper.set_target(linear_x, angular_z)
-        self._last_command_time = time.time()
-        self._last_twist = (linear_x, angular_z)
+        self._send_twist_impl(self._ramper, linear_x, angular_z)
 
     def _send_twist_joy(self, linear_x: float, angular_z: float):
         """Set target velocity for joystick — uses joystick ramper."""
+        self._send_twist_impl(self._joy_ramper, linear_x, angular_z)
+
+    def _send_twist_impl(
+        self, ramper: 'VelocityRamper', linear_x: float, angular_z: float,
+    ):
+        """Send velocity command through the specified ramper.
+
+        Blocks forward motion when emergency stop is active.
+        """
         if self.emergency_stop and linear_x > 0:
             linear_x = 0.0
             angular_z = 0.0
 
-        self._joy_ramper.set_target(linear_x, angular_z)
+        ramper.set_target(linear_x, angular_z)
         self._last_command_time = time.time()
         self._last_twist = (linear_x, angular_z)
 
@@ -821,10 +824,9 @@ class AutonomousExplorer(Node):
         self._ramper.emergency_stop()
         self._joy_ramper.emergency_stop()
         if self._estop_lock_pub:
-            from std_msgs.msg import Bool
-            msg = Bool()
-            msg.data = True
-            self._estop_lock_pub.publish(msg)
+            lock_msg = Bool()
+            lock_msg.data = True
+            self._estop_lock_pub.publish(lock_msg)
         self._last_command_time = time.time()
         self._last_twist = (0.0, 0.0)
 
@@ -1071,29 +1073,37 @@ class AutonomousExplorer(Node):
             safety['override_action'] = 'stop'
             return safety
 
-        # Execute for the specified duration, checking safety continuously.
-        # Begin deceleration before duration ends for smooth stop.
-        decel_time = min(0.4, duration * 0.3)  # ramp down over last 0.4s (or 30%)
+        # Execute for the specified duration with safety monitoring
+        interrupted = self._run_timed_action(exec_start, duration)
+        if interrupted:
+            safety['triggered'] = True
+            safety['reason'] = 'emergency stop during execution'
+            safety['override_action'] = 'stop'
+        return safety
+
+    def _run_timed_action(self, start_time: float, duration: float) -> bool:
+        """Run the current motor command for `duration` seconds.
+
+        Monitors emergency stop and begins smooth deceleration before
+        the duration expires. Returns True if interrupted by e-stop.
+        """
+        decel_time = min(0.4, duration * 0.3)
         decel_start = duration - decel_time
 
         while self.running:
-            elapsed = time.time() - exec_start
+            elapsed = time.time() - start_time
             if elapsed >= duration:
                 break
             if self.emergency_stop:
                 self.get_logger().warn('Emergency stop during action!')
                 self._emergency_stop_motors()
-                safety['triggered'] = True
-                safety['reason'] = 'emergency stop during execution'
-                safety['override_action'] = 'stop'
-                return safety
-            # Begin smooth deceleration before end of duration
+                return True
             if elapsed >= decel_start:
                 self._ramper.stop()
             time.sleep(0.05)
 
         self._stop_motors()
-        return safety
+        return False
 
     def _look_around_sequence(self):
         """Pan the camera to survey surroundings."""
@@ -1218,88 +1228,109 @@ class AutonomousExplorer(Node):
                 self.get_logger().error(f'Voice listener error: {e}')
                 time.sleep(1.0)
 
+    # Voice command dispatch table: (keywords, handler_method_name)
+    # Each handler takes (self, command_text) and returns bool
+    # (whether exploration should continue).
+    _VOICE_COMMANDS = [
+        (['manual mode', 'manual control', 'take control', 'joystick'],
+         '_voice_cmd_manual'),
+        (['autonomous mode', 'auto mode', 'automatic mode', 'autopilot'],
+         '_voice_cmd_autonomous'),
+        (['stop exploring', 'stop', 'halt', 'freeze'],
+         '_voice_cmd_stop'),
+        (['start exploring', 'start', 'go', 'explore'],
+         '_voice_cmd_start'),
+        (['what do you see', 'what is around', 'describe', 'look'],
+         '_voice_cmd_describe'),
+        (['go left', 'turn left'],
+         '_voice_cmd_turn_left'),
+        (['go right', 'turn right'],
+         '_voice_cmd_turn_right'),
+        (['go forward', 'move forward', 'go ahead'],
+         '_voice_cmd_forward'),
+        (['go back', 'reverse', 'back up'],
+         '_voice_cmd_backward'),
+    ]
+
     def _process_voice_command(self, command: str) -> bool:
         """Handle a voice command. Returns True if exploration should continue."""
         cmd = command.lower().strip()
         self.get_logger().info(f'Voice command: {cmd}')
 
-        if any(w in cmd for w in ['manual mode', 'manual control',
-                                     'take control', 'joystick']):
-            if self.control_mode != 'manual':
-                self._toggle_control_mode()
-            else:
-                self.voice.speak('Already in manual mode.')
-            return False
-        elif any(w in cmd for w in ['autonomous mode', 'auto mode',
-                                      'automatic mode', 'autopilot']):
-            if self.control_mode != 'autonomous':
-                self._toggle_control_mode()
-            else:
-                self.voice.speak('Already in autonomous mode.')
-            return self.exploring
-        elif any(w in cmd for w in ['stop exploring', 'stop', 'halt', 'freeze']):
-            self.exploring = False
-            self._stop_motors()
-            self.voice.speak('Stopping exploration. Standing by.')
-            return False
-        elif any(w in cmd for w in ['start exploring', 'start', 'go', 'explore']):
-            if self.control_mode == 'manual':
-                self.voice.speak(
-                    'Cannot start exploration in manual mode. '
-                    'Switch to autonomous mode first.'
-                )
-                return False
-            self.exploring = True
-            self.voice.speak('Starting exploration! Let me see what is around.')
-            return True
-        elif any(w in cmd for w in ['what do you see', 'what is around',
-                                     'describe', 'look']):
-            self.voice.speak('Let me look around and tell you what I see.')
-            # The next LLM call will describe the scene
-            return self.exploring
-        elif any(w in cmd for w in ['go left', 'turn left']):
-            self.voice.speak('Turning left.')
-            self._execute_action({
-                'action': 'spin_left', 'speed': 0.3, 'duration': 1.0,
-            })
-            return self.exploring
-        elif any(w in cmd for w in ['go right', 'turn right']):
-            self.voice.speak('Turning right.')
-            self._execute_action({
-                'action': 'spin_right', 'speed': 0.3, 'duration': 1.0,
-            })
-            return self.exploring
-        elif any(w in cmd for w in ['go forward', 'move forward', 'go ahead']):
-            self.voice.speak('Moving forward.')
-            self._execute_action({
-                'action': 'forward', 'speed': 0.3, 'duration': 1.5,
-            })
-            return self.exploring
-        elif any(w in cmd for w in ['go back', 'reverse', 'back up']):
-            self.voice.speak('Backing up.')
-            self._execute_action({
-                'action': 'backward', 'speed': 0.3, 'duration': 1.0,
-            })
-            return self.exploring
+        for keywords, handler_name in self._VOICE_COMMANDS:
+            if any(kw in cmd for kw in keywords):
+                handler = getattr(self, handler_name)
+                return handler(command)
+
+        self.voice.speak(f'I heard: {command}')
+        return self.exploring
+
+    def _voice_cmd_manual(self, _cmd: str) -> bool:
+        if self.control_mode != 'manual':
+            self._toggle_control_mode()
         else:
-            self.voice.speak(f'I heard: {command}')
-            return self.exploring
+            self.voice.speak('Already in manual mode.')
+        return False
+
+    def _voice_cmd_autonomous(self, _cmd: str) -> bool:
+        if self.control_mode != 'autonomous':
+            self._toggle_control_mode()
+        else:
+            self.voice.speak('Already in autonomous mode.')
+        return self.exploring
+
+    def _voice_cmd_stop(self, _cmd: str) -> bool:
+        self.exploring = False
+        self._stop_motors()
+        self.voice.speak('Stopping exploration. Standing by.')
+        return False
+
+    def _voice_cmd_start(self, _cmd: str) -> bool:
+        if self.control_mode == 'manual':
+            self.voice.speak(
+                'Cannot start exploration in manual mode. '
+                'Switch to autonomous mode first.'
+            )
+            return False
+        self.exploring = True
+        self.voice.speak('Starting exploration! Let me see what is around.')
+        return True
+
+    def _voice_cmd_describe(self, _cmd: str) -> bool:
+        self.voice.speak('Let me look around and tell you what I see.')
+        return self.exploring
+
+    def _voice_cmd_turn_left(self, _cmd: str) -> bool:
+        self.voice.speak('Turning left.')
+        self._execute_action({'action': 'spin_left', 'speed': 0.3, 'duration': 1.0})
+        return self.exploring
+
+    def _voice_cmd_turn_right(self, _cmd: str) -> bool:
+        self.voice.speak('Turning right.')
+        self._execute_action({'action': 'spin_right', 'speed': 0.3, 'duration': 1.0})
+        return self.exploring
+
+    def _voice_cmd_forward(self, _cmd: str) -> bool:
+        self.voice.speak('Moving forward.')
+        self._execute_action({'action': 'forward', 'speed': 0.3, 'duration': 1.5})
+        return self.exploring
+
+    def _voice_cmd_backward(self, _cmd: str) -> bool:
+        self.voice.speak('Backing up.')
+        self._execute_action({'action': 'backward', 'speed': 0.3, 'duration': 1.0})
+        return self.exploring
 
     # ======================================================================
     # Main Exploration Loop
     # ======================================================================
 
-    def _exploration_loop(self):
-        """Background thread: continuous sense -> think -> act -> speak cycle."""
-        self.get_logger().info('Exploration loop started (waiting for start command)')
-        self._center_camera()
+    def _wait_for_camera(self):
+        """Block until the first camera frame arrives, or timeout.
 
-        # Wait for first camera frame (skip in dry-run mode)
+        In dry-run mode, creates a dummy frame instead of waiting.
+        """
         if self.provider_name in ('dryrun', 'dry-run', 'dry_run'):
-            self.get_logger().info(
-                'Dry-run mode: using dummy camera frame'
-            )
-            # Create a small dummy image so the pipeline has something to encode
+            self.get_logger().info('Dry-run mode: using dummy camera frame')
             with self._rgb_lock:
                 if self._rgb_image is None:
                     self._rgb_image = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -1307,34 +1338,381 @@ class AutonomousExplorer(Node):
                         self._rgb_image, 'DRY RUN', (180, 250),
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3,
                     )
-        else:
-            for i in range(20):
-                if not self.running:
+            return
+
+        for i in range(20):
+            if not self.running:
+                return
+            with self._rgb_lock:
+                if self._rgb_image is not None:
+                    self.get_logger().info('Camera feed received. Ready to explore.')
                     return
-                with self._rgb_lock:
-                    has_image = self._rgb_image is not None
-                if has_image:
-                    break
-                if i % 2 == 0:
-                    self.get_logger().info('Waiting for camera feed...')
-                time.sleep(0.5)
-            else:
-                cam_type = os.environ.get('DEPTH_CAMERA_TYPE', 'not set')
-                self.get_logger().warn(
-                    f'No camera frame received after 10s. '
-                    f'Is the camera running? (DEPTH_CAMERA_TYPE={cam_type})'
+            if i % 2 == 0:
+                self.get_logger().info('Waiting for camera feed...')
+            time.sleep(0.5)
+
+        cam_type = os.environ.get('DEPTH_CAMERA_TYPE', 'not set')
+        self.get_logger().warn(
+            f'No camera frame received after 10s. '
+            f'Is the camera running? (DEPTH_CAMERA_TYPE={cam_type})'
+        )
+
+    def _snapshot_sensors(self) -> dict:
+        """Take a thread-safe snapshot of all sensor data.
+
+        Returns a dict with keys: rgb, depth, lidar_sectors, lidar_raw_ranges,
+        imu, odom, image_b64, depth_summary, lidar_summary, memory_context.
+        Returns empty dict if no camera frame is available.
+        """
+        image_b64 = self._get_camera_frame_b64()
+        if not image_b64:
+            return {}
+
+        with self._rgb_lock:
+            rgb = self._rgb_image.copy() if self._rgb_image is not None else None
+        with self._depth_lock:
+            depth = self._depth_image.copy() if self._depth_image is not None else None
+        with self._lidar_lock:
+            lidar_sectors = self._lidar_ranges.copy() if self._lidar_ranges else None
+            lidar_raw_ranges = list(self._lidar_raw.ranges) if self._lidar_raw else None
+        with self._imu_lock:
+            imu = self._imu_data.copy() if self._imu_data else None
+        with self._odom_lock:
+            odom = self._odom_data.copy() if self._odom_data else None
+
+        return {
+            'rgb': rgb,
+            'depth': depth,
+            'lidar_sectors': lidar_sectors,
+            'lidar_raw_ranges': lidar_raw_ranges,
+            'imu': imu,
+            'odom': odom,
+            'image_b64': image_b64,
+            'depth_summary': self._get_depth_summary(),
+            'lidar_summary': self._get_lidar_summary(),
+            'memory_context': self.memory.get_context_summary(),
+        }
+
+    def _build_user_prompt(self, sensors: dict) -> tuple[str, str, str | None]:
+        """Build the system prompt and user prompt for the LLM.
+
+        Args:
+            sensors: Snapshot dict from _snapshot_sensors().
+
+        Returns:
+            (system_prompt, user_prompt, map_b64_or_None)
+        """
+        odom = sensors['odom']
+
+        # Odometry summary
+        odom_summary = ''
+        if odom:
+            heading_deg = math.degrees(odom.get('theta', 0))
+            odom_summary = (
+                f'ODOMETRY: position=({odom.get("x", 0):.2f}, '
+                f'{odom.get("y", 0):.2f}) m, '
+                f'heading={heading_deg:.1f}\u00b0'
+            )
+
+        # IMU summary
+        imu_summary = ''
+        if sensors['imu']:
+            ori = sensors['imu'].get('orientation', {})
+            imu_summary = (
+                f'IMU: roll={math.degrees(ori.get("roll", 0)):.1f}\u00b0, '
+                f'pitch={math.degrees(ori.get("pitch", 0)):.1f}\u00b0, '
+                f'yaw={math.degrees(ori.get("yaw", 0)):.1f}\u00b0'
+            )
+
+        # Hybrid-mode extras (map image, frontier goals)
+        map_summary = ''
+        map_b64 = None
+        frontier_summary = ''
+        if self.use_nav2 and self.nav2 and self.nav2.has_map:
+            rx = odom.get('x', 0) if odom else 0
+            ry = odom.get('y', 0) if odom else 0
+            rt = odom.get('theta', 0) if odom else 0
+            map_img = self.nav2.render_map_image(rx, ry, rt)
+            if map_img is not None:
+                _, map_jpg = cv2.imencode(
+                    '.jpg', map_img, [cv2.IMWRITE_JPEG_QUALITY, 80],
+                )
+                map_b64 = base64.b64encode(map_jpg.tobytes()).decode('utf-8')
+
+            ms = self.nav2.get_map_stats()
+            if ms:
+                map_summary = (
+                    f'MAP: {ms.get("explored_pct", 0)}% explored, '
+                    f'{ms.get("area_m2", 0)}m\u00b2 mapped, '
+                    f'{ms.get("free_cells", 0)} free / '
+                    f'{ms.get("occupied_cells", 0)} walls / '
+                    f'{ms.get("unknown_cells", 0)} unknown cells'
                 )
 
-        if self._rgb_image is not None:
-            self.get_logger().info('Camera feed received. Ready to explore.')
-        if self.provider_name in ('dryrun', 'dry-run', 'dry_run'):
-            self.get_logger().info('Dry-run mode: auto-starting exploration')
+            frontiers = self.nav2.get_frontier_goals(rx, ry)
+            if frontiers:
+                parts = [
+                    f'  F{i+1}: ({f["x"]:.2f},{f["y"]:.2f}) '
+                    f'dist={f["distance"]:.1f}m size={f["size"]}'
+                    for i, f in enumerate(frontiers[:5])
+                ]
+                frontier_summary = (
+                    'FRONTIER GOALS (unexplored boundaries):\n'
+                    + '\n'.join(parts)
+                )
+
+        # System prompt
+        base_prompt = HYBRID_SYSTEM_PROMPT if self.use_nav2 else SYSTEM_PROMPT
+        system_prompt = build_system_prompt(base_prompt)
+
+        # User prompt with identity + knowledge context
+        identity_context = self.consciousness.get_identity_context()
+        knowledge_context = self.world_knowledge.get_prompt_context(
+            x=odom.get('x', 0) if odom else 0,
+            y=odom.get('y', 0) if odom else 0,
+            theta=odom.get('theta', 0) if odom else 0,
+        )
+
+        user_prompt = f'{identity_context}\n\n'
+        if knowledge_context:
+            user_prompt += f'{knowledge_context}\n\n'
+        user_prompt += (
+            f'Current sensor data:\n'
+            f'{sensors["lidar_summary"]}\n'
+            f'{sensors["depth_summary"]}\n'
+            f'{odom_summary}\n'
+            f'{imu_summary}\n'
+        )
+        if map_summary:
+            user_prompt += f'{map_summary}\n'
+        if frontier_summary:
+            user_prompt += f'{frontier_summary}\n'
+        user_prompt += (
+            f'\nExploration context:\n{sensors["memory_context"]}\n'
+            f'\nAnalyze the camera image'
+        )
+        if map_b64:
+            user_prompt += ' and the bird\'s-eye map'
+        user_prompt += (
+            ' and ALL sensor data. '
+            'Decide your next action. Respond in JSON only.'
+        )
+
+        return system_prompt, user_prompt, map_b64
+
+    def _call_llm(self, sensors: dict, system_prompt: str, user_prompt: str,
+                  map_b64: str | None) -> tuple[dict, dict, float]:
+        """Call the LLM provider and return parsed result, metadata, and cost.
+
+        Returns:
+            (result_dict, meta_dict, cost_usd)
+        """
+        self.get_logger().info(
+            f'Calling {self.provider_name} for scene analysis...'
+        )
+
+        images = [sensors['image_b64']]
+        if map_b64:
+            images.append(map_b64)
+
+        result = self.llm.analyze_scene(images, system_prompt, user_prompt)
+
+        meta = result.pop('_meta', {})
+        t_elapsed_ms = meta.get('response_time_ms', 0)
+        tokens_in = meta.get('tokens_input', 0)
+        tokens_out = meta.get('tokens_output', 0)
+
+        cost_in = tokens_in * COST_PER_M_INPUT_TOKENS.get(
+            self.provider_name, 3.0) / 1_000_000
+        cost_out = tokens_out * COST_PER_M_OUTPUT_TOKENS.get(
+            self.provider_name, 15.0) / 1_000_000
+        cost_usd = cost_in + cost_out
+
+        self.get_logger().info(
+            f'LLM response ({t_elapsed_ms}ms, '
+            f'{tokens_in}+{tokens_out} tok, ${cost_usd:.4f}): '
+            f'action={result.get("action")} '
+            f'speech="{result.get("speech", "")[:60]}"'
+        )
+
+        return result, meta, cost_usd
+
+    def _update_dashboard_state(self, result: dict, meta: dict,
+                                cost_usd: float, safety_info: dict):
+        """Update LLM and safety state for the status dashboard."""
+        self._cycle_count += 1
+        self._session_total_cost += cost_usd
+
+        with self._llm_lock:
+            s = self._llm_state
+            s.action = result.get('action', '')
+            s.speed = float(result.get('speed', 0.0))
+            s.duration = float(result.get('duration', 0.0))
+            s.reasoning = result.get('reasoning', '')
+            s.speech = result.get('speech', '')
+            s.response_ms = meta.get('response_time_ms', 0)
+            s.tokens_in = meta.get('tokens_input', 0)
+            s.tokens_out = meta.get('tokens_output', 0)
+            s.cost = cost_usd
+            s.timestamp = time.time()
+            s.safety_triggered = safety_info.get('triggered', False)
+            s.safety_reason = safety_info.get('reason', '')
+
+    def _record_cycle(self, result: dict, meta: dict, cost_usd: float,
+                      safety_info: dict, sensors: dict,
+                      system_prompt: str, user_prompt: str,
+                      exec_duration_ms: int, actual_action: str,
+                      speech_text: str, voice_cmd: str | None):
+        """Record exploration memory, consciousness, knowledge, and data log."""
+        odom = sensors.get('odom')
+        lidar_sectors = sensors.get('lidar_sectors')
+        lidar_summary = sensors.get('lidar_summary', '')
+
+        # Exploration memory
+        self.memory.record_action(
+            result, lidar_summary, odom=odom, lidar_sectors=lidar_sectors,
+        )
+
+        reasoning = result.get('reasoning', '')
+        if reasoning:
+            self.get_logger().info(f'Reasoning: {reasoning[:120]}')
+
+        # Consciousness: reflection + cycle stats
+        reflection = result.get('embodied_reflection', '')
+        if reflection:
+            self.consciousness.record_reflection(reflection)
+
+        self.consciousness.record_cycle(
+            result, safety_info, cost_usd,
+            distance_delta=self._get_odom_distance_delta(odom),
+        )
+
+        # World knowledge
+        self.world_knowledge.update_from_response(result, odom=odom)
+        for room in self.world_knowledge.world_map.get('rooms', {}):
+            self.consciousness.record_room(room)
+
+        # Data logger
+        rgb = sensors.get('rgb')
+        img_h, img_w = (rgb.shape[:2] if rgb is not None else (0, 0))
+        image_b64 = sensors.get('image_b64', '')
+        image_size_bytes = len(image_b64) * 3 // 4
+
+        self.data_logger.log_cycle(
+            rgb_image=rgb,
+            depth_image=sensors.get('depth'),
+            lidar_ranges=sensors.get('lidar_raw_ranges'),
+            lidar_sectors=lidar_sectors,
+            imu_data=sensors.get('imu'),
+            odom_data=odom,
+            battery_voltage=self._battery_voltage,
+            provider=self.provider_name,
+            model=meta.get('model', ''),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_resolution=f'{img_w}x{img_h}',
+            image_size_bytes=image_size_bytes,
+            raw_response=meta.get('raw_response', ''),
+            parsed_action=result.get('action', ''),
+            speed=result.get('speed', 0.0),
+            duration=result.get('duration', 0.0),
+            speech=speech_text,
+            reasoning=reasoning,
+            response_time_ms=meta.get('response_time_ms', 0),
+            tokens_input=meta.get('tokens_input', 0),
+            tokens_output=meta.get('tokens_output', 0),
+            cost_usd=cost_usd,
+            safety_triggered=safety_info.get('triggered', False),
+            safety_reason=safety_info.get('reason', ''),
+            safety_original_action=safety_info.get('original_action', ''),
+            safety_override_action=safety_info.get('override_action', ''),
+            actual_action=actual_action,
+            motor_left_speed=self._last_twist[0],
+            motor_right_speed=self._last_twist[1],
+            servo_pan=self._last_servo_pan,
+            servo_tilt=self._last_servo_tilt,
+            execution_duration_ms=exec_duration_ms,
+            voice_command=voice_cmd,
+            speech_output=speech_text,
+            total_distance=round(self._total_distance, 3),
+            areas_visited=self.memory.total_actions,
+            objects_discovered=[
+                d['description'][:60] for d in self.memory.discoveries[-20:]
+            ],
+            map_coverage_pct=(
+                self.nav2.get_map_stats().get('explored_pct', 0.0)
+                if self.use_nav2 and self.nav2 and self.nav2.has_map
+                else 0.0
+            ),
+            embodied_reflection=reflection,
+            outing_number=self.consciousness.outing_number,
+        )
+
+    def _get_odom_distance_delta(self, odom: dict | None) -> float:
+        """Compute distance traveled since last recorded odom position.
+
+        Uses a separate pair of tracking variables so this is independent
+        of the continuous odometry accumulation in _odom_callback.
+        """
+        if not odom:
+            return 0.0
+        x, y = odom.get('x', 0), odom.get('y', 0)
+        if self._prev_cycle_odom_x is None:
+            self._prev_cycle_odom_x = x
+            self._prev_cycle_odom_y = y
+            return 0.0
+        dx = x - self._prev_cycle_odom_x
+        dy = y - self._prev_cycle_odom_y
+        self._prev_cycle_odom_x = x
+        self._prev_cycle_odom_y = y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _check_stuck_watchdog(self, odom: dict | None):
+        """Force recovery action if the robot hasn't moved enough."""
+        if (self._cycle_count - self._stuck_check_cycle
+                < self._stuck_cycles_threshold):
+            return
+
+        dist_since = self._total_distance - self._stuck_check_distance
+        if dist_since < self._stuck_distance_threshold:
+            self.get_logger().warn(
+                f'Stuck watchdog: only {dist_since:.2f}m in '
+                f'{self._stuck_cycles_threshold} cycles. Forcing recovery.'
+            )
+            if self.use_nav2 and self.nav2 and self.nav2.has_map:
+                rx = odom.get('x', 0) if odom else 0
+                ry = odom.get('y', 0) if odom else 0
+                frontiers = self.nav2.get_frontier_goals(rx, ry)
+                if frontiers:
+                    f = frontiers[0]
+                    self.get_logger().info(
+                        f'Stuck recovery: navigating to frontier '
+                        f'({f["x"]:.1f}, {f["y"]:.1f})'
+                    )
+                    self.nav2.navigate_to(f['x'], f['y'])
+            else:
+                # Use _execute_action instead of sleep-blocking the loop.
+                # This respects emergency stop and uses proper ramping.
+                self.get_logger().info('Stuck recovery: forced spin')
+                self._execute_action({
+                    'action': 'spin_left',
+                    'speed': 0.7,
+                    'duration': 2.0,
+                })
+
+        self._stuck_check_distance = self._total_distance
+        self._stuck_check_cycle = self._cycle_count
+
+    def _exploration_loop(self):
+        """Background thread: continuous sense -> think -> act -> speak cycle."""
+        self.get_logger().info('Exploration loop started (waiting for start command)')
+        self._center_camera()
+        self._wait_for_camera()
+
         self.exploring = True
         self.get_logger().info('Auto-starting exploration')
         if self.voice_on:
-            self.voice.speak(
-                'I am Jeeves, and I am ready to explore.',
-            )
+            self.voice.speak('I am Jeeves, and I am ready to explore.')
 
         while self.running:
             try:
@@ -1356,360 +1734,56 @@ class AutonomousExplorer(Node):
                     time.sleep(0.5)
                     continue
 
-                # ----------------------------------------------------------
-                # SENSE: Gather sensor data
-                # ----------------------------------------------------------
-                image_b64 = self._get_camera_frame_b64()
-                if not image_b64:
+                # SENSE
+                sensors = self._snapshot_sensors()
+                if not sensors:
                     self.get_logger().warn('No camera frame available')
                     time.sleep(1.0)
                     continue
 
-                # Snapshot raw sensor data for logging
-                with self._rgb_lock:
-                    rgb_snapshot = self._rgb_image.copy() if self._rgb_image is not None else None
-                with self._depth_lock:
-                    depth_snapshot = self._depth_image.copy() if self._depth_image is not None else None
-                with self._lidar_lock:
-                    lidar_sectors = self._lidar_ranges.copy() if self._lidar_ranges else None
-                    lidar_raw_ranges = list(self._lidar_raw.ranges) if self._lidar_raw else None
-                with self._imu_lock:
-                    imu_snapshot = self._imu_data.copy() if self._imu_data else None
-                with self._odom_lock:
-                    odom_snapshot = self._odom_data.copy() if self._odom_data else None
+                # BUILD PROMPT
+                system_prompt, user_prompt, map_b64 = self._build_user_prompt(
+                    sensors)
 
-                depth_summary = self._get_depth_summary()
-                lidar_summary = self._get_lidar_summary()
-                memory_context = self.memory.get_context_summary()
+                # THINK
+                result, meta, cost_usd = self._call_llm(
+                    sensors, system_prompt, user_prompt, map_b64)
 
-                # Build odometry summary (theta stored in radians)
-                odom_summary = ''
-                if odom_snapshot:
-                    heading_deg = math.degrees(odom_snapshot.get('theta', 0))
-                    odom_summary = (
-                        f'ODOMETRY: position=({odom_snapshot.get("x", 0):.2f}, '
-                        f'{odom_snapshot.get("y", 0):.2f}) m, '
-                        f'heading={heading_deg:.1f}°'
-                    )
-
-                # Build IMU summary (orientation stored in radians)
-                imu_summary = ''
-                if imu_snapshot:
-                    ori = imu_snapshot.get('orientation', {})
-                    imu_summary = (
-                        f'IMU: roll={math.degrees(ori.get("roll", 0)):.1f}°, '
-                        f'pitch={math.degrees(ori.get("pitch", 0)):.1f}°, '
-                        f'yaw={math.degrees(ori.get("yaw", 0)):.1f}°'
-                    )
-
-                # Build hybrid-mode extras (map image, frontier goals)
-                map_summary = ''
-                map_b64 = None
-                frontier_summary = ''
-                if self.use_nav2 and self.nav2 and self.nav2.has_map:
-                    # Render bird's-eye map image
-                    rx = odom_snapshot.get('x', 0) if odom_snapshot else 0
-                    ry = odom_snapshot.get('y', 0) if odom_snapshot else 0
-                    rt = odom_snapshot.get('theta', 0) if odom_snapshot else 0
-                    map_img = self.nav2.render_map_image(rx, ry, rt)
-                    if map_img is not None:
-                        _, map_jpg = cv2.imencode(
-                            '.jpg', map_img,
-                            [cv2.IMWRITE_JPEG_QUALITY, 80],
-                        )
-                        map_b64 = base64.b64encode(
-                            map_jpg.tobytes()
-                        ).decode('utf-8')
-
-                    # Map stats
-                    ms = self.nav2.get_map_stats()
-                    if ms:
-                        map_summary = (
-                            f'MAP: {ms.get("explored_pct", 0)}% explored, '
-                            f'{ms.get("area_m2", 0)}m² mapped, '
-                            f'{ms.get("free_cells", 0)} free / '
-                            f'{ms.get("occupied_cells", 0)} walls / '
-                            f'{ms.get("unknown_cells", 0)} unknown cells'
-                        )
-
-                    # Frontier goals
-                    frontiers = self.nav2.get_frontier_goals(rx, ry)
-                    if frontiers:
-                        parts = []
-                        for i, f in enumerate(frontiers[:5]):
-                            parts.append(
-                                f'  F{i+1}: ({f["x"]:.2f},{f["y"]:.2f}) '
-                                f'dist={f["distance"]:.1f}m size={f["size"]}'
-                            )
-                        frontier_summary = (
-                            'FRONTIER GOALS (unexplored boundaries):\n'
-                            + '\n'.join(parts)
-                        )
-
-                # Select system prompt based on mode (with embodied preamble)
-                base_prompt = (
-                    HYBRID_SYSTEM_PROMPT if self.use_nav2
-                    else SYSTEM_PROMPT
-                )
-                active_prompt = build_system_prompt(base_prompt)
-
-                # Build user prompt with identity + knowledge context
-                identity_context = self.consciousness.get_identity_context()
-                knowledge_context = self.world_knowledge.get_prompt_context(
-                    x=odom_snapshot.get('x', 0) if odom_snapshot else 0,
-                    y=odom_snapshot.get('y', 0) if odom_snapshot else 0,
-                    theta=odom_snapshot.get('theta', 0) if odom_snapshot else 0,
-                )
-
-                user_prompt = f'{identity_context}\n\n'
-                if knowledge_context:
-                    user_prompt += f'{knowledge_context}\n\n'
-                user_prompt += (
-                    f'Current sensor data:\n'
-                    f'{lidar_summary}\n'
-                    f'{depth_summary}\n'
-                    f'{odom_summary}\n'
-                    f'{imu_summary}\n'
-                )
-                if map_summary:
-                    user_prompt += f'{map_summary}\n'
-                if frontier_summary:
-                    user_prompt += f'{frontier_summary}\n'
-                user_prompt += (
-                    f'\nExploration context:\n{memory_context}\n'
-                    f'\nAnalyze the camera image'
-                )
-                if map_b64:
-                    user_prompt += ' and the bird\'s-eye map'
-                user_prompt += (
-                    ' and ALL sensor data. '
-                    'Decide your next action. Respond in JSON only.'
-                )
-
-                # Image metadata for logging
-                img_h, img_w = (rgb_snapshot.shape[:2] if rgb_snapshot is not None
-                                else (0, 0))
-                image_size_bytes = len(image_b64) * 3 // 4  # approx decoded size
-
-                # ----------------------------------------------------------
-                # THINK: Call LLM with vision
-                # ----------------------------------------------------------
-                self.get_logger().info(
-                    f'Calling {self.provider_name} for scene analysis...'
-                )
-
-                # In hybrid mode, send map image as second image
-                images = [image_b64]
-                if map_b64:
-                    images.append(map_b64)
-
-                result = self.llm.analyze_scene(
-                    images, active_prompt, user_prompt,
-                )
-
-                # Extract metadata from provider
-                meta = result.pop('_meta', {})
-                t_elapsed_ms = meta.get('response_time_ms', 0)
-                tokens_in = meta.get('tokens_input', 0)
-                tokens_out = meta.get('tokens_output', 0)
-                raw_response = meta.get('raw_response', '')
-
-                # Estimate cost
-                cost_in = tokens_in * COST_PER_M_INPUT_TOKENS.get(
-                    self.provider_name, 3.0) / 1_000_000
-                cost_out = tokens_out * COST_PER_M_OUTPUT_TOKENS.get(
-                    self.provider_name, 15.0) / 1_000_000
-                cost_usd = cost_in + cost_out
-
-                self.get_logger().info(
-                    f'LLM response ({t_elapsed_ms}ms, '
-                    f'{tokens_in}+{tokens_out} tok, ${cost_usd:.4f}): '
-                    f'action={result.get("action")} '
-                    f'speech="{result.get("speech", "")[:60]}"'
-                )
-
-                # Update LLM state for dashboard
-                self._cycle_count += 1
-                self._session_total_cost += cost_usd
-                with self._llm_lock:
-                    self._last_llm_action = result.get('action', '')
-                    self._last_llm_speed = float(result.get('speed', 0.0))
-                    self._last_llm_duration = float(result.get('duration', 0.0))
-                    self._last_llm_reasoning = result.get('reasoning', '')
-                    self._last_llm_speech = result.get('speech', '')
-                    self._last_llm_response_ms = t_elapsed_ms
-                    self._last_llm_tokens_in = tokens_in
-                    self._last_llm_tokens_out = tokens_out
-                    self._last_llm_cost = cost_usd
-                    self._last_llm_time = time.time()
-
-                # ----------------------------------------------------------
-                # SPEAK: Announce what the robot is thinking
-                # ----------------------------------------------------------
+                # SPEAK
                 speech_text = result.get('speech', '')
                 if speech_text and self.voice_on:
                     self.voice.speak(speech_text)
 
-                # ----------------------------------------------------------
-                # ACT: Execute the chosen action
-                # ----------------------------------------------------------
+                # ACT
                 exec_start = time.time()
                 safety_info = self._execute_action(result)
                 exec_duration_ms = int((time.time() - exec_start) * 1000)
+                actual_action = safety_info.get(
+                    'override_action', result.get('action', 'stop'))
 
-                actual_action = safety_info.get('override_action',
-                                                result.get('action', 'stop'))
+                # UPDATE DASHBOARD
+                self._update_dashboard_state(result, meta, cost_usd, safety_info)
 
-                # Update safety state for dashboard
-                with self._llm_lock:
-                    self._last_safety_triggered = safety_info.get(
-                        'triggered', False)
-                    self._last_safety_reason = safety_info.get('reason', '')
-
-                # ----------------------------------------------------------
-                # REMEMBER: Log the decision
-                # ----------------------------------------------------------
-                self.memory.record_action(
-                    result, lidar_summary,
-                    odom=odom_snapshot,
-                    lidar_sectors=lidar_sectors,
+                # REMEMBER + LOG
+                self._record_cycle(
+                    result, meta, cost_usd, safety_info, sensors,
+                    system_prompt, user_prompt, exec_duration_ms,
+                    actual_action, speech_text, voice_cmd,
                 )
 
-                # Log reasoning
-                reasoning = result.get('reasoning', '')
-                if reasoning:
-                    self.get_logger().info(f'Reasoning: {reasoning[:120]}')
+                # STUCK WATCHDOG
+                self._check_stuck_watchdog(sensors.get('odom'))
 
-                # ----------------------------------------------------------
-                # CONSCIOUSNESS: Track reflection and update knowledge
-                # ----------------------------------------------------------
-                reflection = result.get('embodied_reflection', '')
-                if reflection:
-                    self.consciousness.record_reflection(reflection)
-
-                # Compute distance delta for this cycle
-                _dist_delta = 0.0
-                if odom_snapshot and self._prev_odom_x is not None:
-                    dx = odom_snapshot.get('x', 0) - self._prev_odom_x
-                    dy = odom_snapshot.get('y', 0) - self._prev_odom_y
-                    _dist_delta = math.sqrt(dx * dx + dy * dy)
-
-                self.consciousness.record_cycle(
-                    result, safety_info, cost_usd,
-                    distance_delta=_dist_delta,
-                )
-                self.world_knowledge.update_from_response(
-                    result, odom=odom_snapshot,
-                )
-
-                # Detect room mentions for consciousness tracking
-                for room in self.world_knowledge.world_map.get('rooms', {}):
-                    self.consciousness.record_room(room)
-
-                # ----------------------------------------------------------
-                # LOG: Full cycle record for dataset collection
-                # ----------------------------------------------------------
-                self.data_logger.log_cycle(
-                    # Sensor data
-                    rgb_image=rgb_snapshot,
-                    depth_image=depth_snapshot,
-                    lidar_ranges=lidar_raw_ranges,
-                    lidar_sectors=lidar_sectors,
-                    imu_data=imu_snapshot,
-                    odom_data=odom_snapshot,
-                    battery_voltage=self._battery_voltage,
-                    # LLM I/O
-                    provider=self.provider_name,
-                    model=meta.get('model', ''),
-                    system_prompt=active_prompt,
-                    user_prompt=user_prompt,
-                    image_resolution=f'{img_w}x{img_h}',
-                    image_size_bytes=image_size_bytes,
-                    raw_response=raw_response,
-                    parsed_action=result.get('action', ''),
-                    speed=result.get('speed', 0.0),
-                    duration=result.get('duration', 0.0),
-                    speech=speech_text,
-                    reasoning=reasoning,
-                    response_time_ms=t_elapsed_ms,
-                    tokens_input=tokens_in,
-                    tokens_output=tokens_out,
-                    cost_usd=cost_usd,
-                    # Safety
-                    safety_triggered=safety_info.get('triggered', False),
-                    safety_reason=safety_info.get('reason', ''),
-                    safety_original_action=safety_info.get('original_action', ''),
-                    safety_override_action=safety_info.get('override_action', ''),
-                    # Execution
-                    actual_action=actual_action,
-                    motor_left_speed=self._last_twist[0],
-                    motor_right_speed=self._last_twist[1],
-                    servo_pan=self._last_servo_pan,
-                    servo_tilt=self._last_servo_tilt,
-                    execution_duration_ms=exec_duration_ms,
-                    # Voice
-                    voice_command=voice_cmd,
-                    speech_output=speech_text,
-                    # Exploration memory
-                    total_distance=round(self._total_distance, 3),
-                    areas_visited=self.memory.total_actions,
-                    objects_discovered=[
-                        d['description'][:60]
-                        for d in self.memory.discoveries[-20:]
-                    ],
-                    map_coverage_pct=(
-                        self.nav2.get_map_stats().get('explored_pct', 0.0)
-                        if self.use_nav2 and self.nav2 and self.nav2.has_map
-                        else 0.0
-                    ),
-                    # Consciousness
-                    embodied_reflection=reflection,
-                    outing_number=self.consciousness.outing_number,
-                )
-
-                # ----------------------------------------------------------
-                # Stuck watchdog: force frontier goal if no progress
-                # ----------------------------------------------------------
-                if (self._cycle_count - self._stuck_check_cycle
-                        >= self._stuck_cycles_threshold):
-                    dist_since = self._total_distance - self._stuck_check_distance
-                    if dist_since < self._stuck_distance_threshold:
-                        self.get_logger().warn(
-                            f'Stuck watchdog: only {dist_since:.2f}m in '
-                            f'{self._stuck_cycles_threshold} cycles. '
-                            f'Forcing recovery.'
-                        )
-                        # Try a frontier goal if Nav2 is available
-                        if self.use_nav2 and self.nav2 and self.nav2.has_map:
-                            rx = odom_snapshot.get('x', 0) if odom_snapshot else 0
-                            ry = odom_snapshot.get('y', 0) if odom_snapshot else 0
-                            frontiers = self.nav2.get_frontier_goals(rx, ry)
-                            if frontiers:
-                                f = frontiers[0]
-                                self.get_logger().info(
-                                    f'Stuck recovery: navigating to frontier '
-                                    f'({f["x"]:.1f}, {f["y"]:.1f})'
-                                )
-                                self.nav2.navigate_to(f['x'], f['y'])
-                        else:
-                            # No Nav2: force a spin to break out
-                            self.get_logger().info('Stuck recovery: forced spin')
-                            self._send_twist(0.0, self.max_angular * 0.7)
-                            time.sleep(2.0)
-                            self._stop_motors()
-                    self._stuck_check_distance = self._total_distance
-                    self._stuck_check_cycle = self._cycle_count
-
-                # ----------------------------------------------------------
-                # Wait before next cycle (compensating — subtract elapsed)
-                # ----------------------------------------------------------
+                # Wait before next cycle (compensating for elapsed time)
                 cycle_elapsed = time.time() - cycle_start
                 remaining = self.loop_interval - cycle_elapsed
                 if remaining > 0:
                     time.sleep(remaining)
 
             except Exception as e:
-                self.get_logger().error(f'Exploration loop error: {e}')
+                self.get_logger().error(
+                    f'Exploration loop error: {e}\n{traceback.format_exc()}'
+                )
                 self._stop_motors()
                 time.sleep(2.0)
 

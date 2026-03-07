@@ -42,6 +42,10 @@ class VoiceIO:
         self._speaking = False
         self._speak_lock = threading.Lock()
 
+        # Cache the detected audio device so we don't shell out on every call.
+        # _find_audio_device() runs arecord -l which is slow on Pi 5.
+        self._cached_device: str | None = None
+
         # Determine which TTS to use
         self._openai_available = bool(openai_api_key)
         if self._openai_available:
@@ -65,7 +69,15 @@ class VoiceIO:
             self.logger.error(msg)
 
     def _find_audio_device(self) -> str:
-        """Try to auto-detect the WonderEcho Pro audio device."""
+        """Return the audio device, auto-detecting on first call.
+
+        Caches the result to avoid running `arecord -l` subprocess on
+        every speak/record call -- meaningful on Pi 5 where subprocess
+        overhead is noticeable.
+        """
+        if self._cached_device is not None:
+            return self._cached_device
+
         try:
             result = subprocess.run(
                 ['arecord', '-l'],
@@ -73,17 +85,19 @@ class VoiceIO:
             )
             for line in result.stdout.splitlines():
                 if 'USB' in line or 'Wonder' in line.lower():
-                    # Parse card number from "card N:"
                     parts = line.split(':')
                     if parts and 'card' in parts[0].lower():
                         card_num = ''.join(
                             c for c in parts[0] if c.isdigit()
                         )
                         if card_num:
-                            return f'plughw:{card_num},0'
+                            self._cached_device = f'plughw:{card_num},0'
+                            return self._cached_device
         except Exception:
             pass
-        return self.audio_device
+
+        self._cached_device = self.audio_device
+        return self._cached_device
 
     def record(self, duration: int = 5, output_path: str = '') -> str:
         """Record audio from WonderEcho Pro mic.

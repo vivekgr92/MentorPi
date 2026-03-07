@@ -15,6 +15,8 @@ import os
 import time
 from datetime import datetime, date
 
+from autonomous_explorer.exploration_memory import speech_contains_discovery
+
 
 class JeevesConsciousness:
     """Manages Jeeves' persistent identity, lifetime stats, and reflections."""
@@ -153,10 +155,7 @@ class JeevesConsciousness:
             self._session_safety_overrides += 1
 
         # Count discoveries from speech keywords
-        speech = result.get('speech', '').lower()
-        discovery_keywords = ['see', 'found', 'notice', 'discover', 'spot',
-                              'interesting', 'detect', 'observe']
-        if any(kw in speech for kw in discovery_keywords):
+        if speech_contains_discovery(result.get('speech', '')):
             self._session_discoveries += 1
 
     def record_reflection(self, text: str):
