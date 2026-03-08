@@ -74,6 +74,11 @@ def generate_launch_description():
             default_value=os.environ.get('DEPTH_CAMERA_TYPE', 'aurora'),
             description='Depth camera type (informational — matches DEPTH_CAMERA_TYPE env var)',
         ),
+        DeclareLaunchArgument(
+            'agent_mode',
+            default_value=os.environ.get('AGENT_MODE', 'false'),
+            description='Enable ROSA-style tool-calling agent mode',
+        ),
 
         # Autonomous Explorer node
         Node(
@@ -89,6 +94,7 @@ def generate_launch_description():
                     'voice_enabled': LaunchConfiguration('voice_enabled'),
                     'max_linear_speed': LaunchConfiguration('max_linear_speed'),
                     'max_angular_speed': LaunchConfiguration('max_angular_speed'),
+                    'agent_mode': LaunchConfiguration('agent_mode'),
                 },
             ],
         ),

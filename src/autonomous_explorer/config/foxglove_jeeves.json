@@ -1,0 +1,275 @@
+{
+  "configById": {
+    "3D!map": {
+      "cameraState": {
+        "distance": 15,
+        "perspective": false,
+        "phi": 90,
+        "target": [0, 0, 0],
+        "thetaDeg": 0,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_footprint",
+      "scene": {
+        "backgroundColor": "#1a1a2e",
+        "enableStats": false
+      },
+      "transforms": {
+        "showLabel": false,
+        "axisScale": 0.5
+      },
+      "topics": {
+        "/map": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.8
+        },
+        "/scan_raw": {
+          "visible": true,
+          "pointSize": 3,
+          "colorMode": "flat",
+          "flatColor": "#00ff88",
+          "decayTime": 0
+        },
+        "/local_costmap/costmap": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.4
+        },
+        "/global_costmap/costmap": {
+          "visible": false,
+          "colorMode": "costmap",
+          "alpha": 0.3
+        }
+      },
+      "publish": {
+        "type": "pose_estimate",
+        "poseTopic": "/initialpose",
+        "pointTopic": "/clicked_point",
+        "poseEstimateThetaDeviation": 0.26
+      }
+    },
+    "Image!camera": {
+      "cameraTopic": "",
+      "enabledMarkerTopics": [],
+      "imageTopic": "/ascamera/camera_publisher/rgb0/image",
+      "transformMarkers": false,
+      "synchronize": false,
+      "smooth": true,
+      "flipHorizontal": false,
+      "flipVertical": false,
+      "maxValue": null,
+      "minValue": null,
+      "rotation": 0
+    },
+    "RawMessages!status": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/explorer/status"
+    },
+    "Plot!lidar": {
+      "title": "LiDAR Distances (m)",
+      "isSynced": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "paths": [
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.lidar.front",
+          "enabled": true,
+          "label": "Front",
+          "color": "#ff4444"
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.lidar.left",
+          "enabled": true,
+          "label": "Left",
+          "color": "#44ff44"
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.lidar.right",
+          "enabled": true,
+          "label": "Right",
+          "color": "#4444ff"
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.lidar.back",
+          "enabled": true,
+          "label": "Back",
+          "color": "#ffaa00"
+        }
+      ],
+      "minYValue": 0,
+      "maxYValue": 5,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 30
+    },
+    "Plot!cost": {
+      "title": "Session Cost ($) & Cycles",
+      "isSynced": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "paths": [
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.session.total_cost",
+          "enabled": true,
+          "label": "Total Cost ($)",
+          "color": "#ff6b6b"
+        }
+      ],
+      "minYValue": 0,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 120
+    },
+    "Plot!velocity": {
+      "title": "Motor Velocity",
+      "isSynced": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "paths": [
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.motors.linear",
+          "enabled": true,
+          "label": "Linear (m/s)",
+          "color": "#4ecdc4"
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.motors.angular",
+          "enabled": true,
+          "label": "Angular (rad/s)",
+          "color": "#ff6b6b"
+        }
+      ],
+      "minYValue": -1.0,
+      "maxYValue": 1.0,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 30
+    },
+    "StateTransitions!mode": {
+      "paths": [
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.mode",
+          "label": "Control Mode"
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.llm.action",
+          "label": "Last Action"
+        }
+      ]
+    },
+    "Log!rosout": {
+      "searchTerms": [],
+      "minLogLevel": 2,
+      "nameFilter": {
+        "autonomous_explorer": true,
+        "slam_toolbox": true,
+        "controller_server": true,
+        "bt_navigator": true
+      }
+    },
+    "Indicator!estop": {
+      "path": "/explorer/status.data.emergency_stop",
+      "style": "background",
+      "fallbackColor": "#00aa00",
+      "fallbackLabel": "CLEAR",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "true",
+          "color": "#ff0000",
+          "label": "E-STOP"
+        }
+      ]
+    },
+    "Indicator!battery": {
+      "path": "/explorer/status.data.battery_voltage",
+      "style": "background",
+      "fallbackColor": "#00aa00",
+      "fallbackLabel": "Battery OK",
+      "rules": [
+        {
+          "operator": "<",
+          "rawValue": "10.5",
+          "color": "#ff0000",
+          "label": "LOW BATTERY"
+        },
+        {
+          "operator": "<",
+          "rawValue": "11.0",
+          "color": "#ffaa00",
+          "label": "Battery Low"
+        }
+      ]
+    }
+  },
+  "globalVariables": {},
+  "userScripts": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "direction": "row",
+    "first": {
+      "direction": "column",
+      "first": {
+        "direction": "row",
+        "first": "3D!map",
+        "second": "Image!camera",
+        "splitPercentage": 55
+      },
+      "second": {
+        "direction": "row",
+        "first": {
+          "direction": "column",
+          "first": "Plot!lidar",
+          "second": "Plot!velocity",
+          "splitPercentage": 50
+        },
+        "second": {
+          "direction": "column",
+          "first": "Plot!cost",
+          "second": "StateTransitions!mode",
+          "splitPercentage": 50
+        },
+        "splitPercentage": 50
+      },
+      "splitPercentage": 60
+    },
+    "second": {
+      "direction": "column",
+      "first": {
+        "direction": "column",
+        "first": "Indicator!estop",
+        "second": "Indicator!battery",
+        "splitPercentage": 50
+      },
+      "second": {
+        "direction": "column",
+        "first": "RawMessages!status",
+        "second": "Log!rosout",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 15
+    },
+    "splitPercentage": 78
+  }
+}

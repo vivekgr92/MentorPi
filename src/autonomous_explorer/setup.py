@@ -40,6 +40,7 @@ setup(
     entry_points={
         'console_scripts': [
             'explorer_node = autonomous_explorer.explorer_node:main',
+            'semantic_map_publisher = autonomous_explorer.semantic_map_publisher:main',
             'dashboard = autonomous_explorer.dashboard:main',
         ],
     },

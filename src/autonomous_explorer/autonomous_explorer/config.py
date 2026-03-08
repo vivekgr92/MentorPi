@@ -106,6 +106,8 @@ MAX_LINEAR_SPEED = 0.35          # m/s — indoor speed limit (was 0.20)
 MAX_ANGULAR_SPEED = 1.0          # rad/s — rotation speed limit (was 0.80)
 MOTOR_TIMEOUT = 6.0              # seconds — stop if no new command
 LIDAR_MAX_SCAN_ANGLE = 240       # degrees — exclude rear blind spot
+CHASSIS_FILTER_M = 0.12          # meters — ignore LiDAR returns closer than this (own chassis)
+SERVO_STEP_US = 100              # microseconds per D-pad tick for camera servo control
 
 # ---------------------------------------------------------------------------
 # Velocity ramping (trapezoidal profiles)
@@ -186,6 +188,14 @@ MEMORY_FILE = os.environ.get(
 MAX_MEMORY_ENTRIES = 200
 
 # ---------------------------------------------------------------------------
+# Stuck detection
+# ---------------------------------------------------------------------------
+STUCK_CYCLES_THRESHOLD = 8       # cycles before checking if robot is stuck
+STUCK_DISTANCE_THRESHOLD = 0.3   # meters — minimum distance to not be "stuck"
+STUCK_RECOVERY_SPEED = 0.7       # speed multiplier for forced spin recovery
+STUCK_RECOVERY_DURATION = 2.0    # seconds for forced spin recovery
+
+# ---------------------------------------------------------------------------
 # Data logging & dataset collection
 # ---------------------------------------------------------------------------
 # Log level: "full" (everything + frames), "compact" (JSON only, no frames),
@@ -227,6 +237,9 @@ STATUS_PUBLISH_RATE = 2.0  # Hz — how often to publish JSON status
 # ---------------------------------------------------------------------------
 USE_NAV2 = os.environ.get('USE_NAV2', 'false').lower() == 'true'
 NAV2_GOAL_TIMEOUT = 30.0          # seconds to wait for Nav2 to reach a goal
+NAV2_CHECK_INTERVAL = 8.0        # seconds between LLM re-evaluations during Nav2 navigation
+NAV2_TOOL_TIMEOUT = 60.0         # seconds — max time for navigate_to tool handler
+NAV2_TOOL_REEVAL_INTERVAL = 8.0  # seconds — return to LLM for re-evaluation during tool navigation
 NAV2_MAP_TOPIC = '/map'           # OccupancyGrid from SLAM
 MAP_IMAGE_SIZE = 256              # bird's-eye map image size for LLM
 
@@ -272,6 +285,62 @@ Action definitions:
 - stop: halt all movement
 - look_around: pan camera to scan surroundings
 - investigate: move slowly toward something interesting (direct motor control)"""
+
+# ---------------------------------------------------------------------------
+# Agent mode (ROSA-style tool-calling)
+# When agent_mode=True, the explorer uses native tool-calling (Claude tool_use
+# / OpenAI function calling) instead of single-action JSON. The LLM reasons,
+# selects tools, we execute them, feed results back — ReAct pattern.
+# ---------------------------------------------------------------------------
+AGENT_MODE = os.environ.get('AGENT_MODE', 'false').lower() == 'true'
+AGENT_MAX_TOOL_ROUNDS = 5  # max tool-call rounds per turn before forcing stop
+AGENT_TURN_TIMEOUT = 30.0  # seconds — max wall time for one agent turn
+AGENT_IDLE_SLEEP = 0.5     # seconds — sleep when agent loop is idle (not exploring)
+AGENT_ERROR_SLEEP = 2.0    # seconds — sleep after agent loop error before retry
+
+AGENT_SYSTEM_PROMPT = """You are Jeeves, an embodied AI butler robot with tank treads. You explore, learn, and serve.
+
+You interact with your body through TOOLS. Each tool performs a real physical action or perception query.
+Think step-by-step: observe your surroundings, reason about what to do, then call the right tools.
+You may call multiple tools per turn when they serve a coherent plan.
+
+CRITICAL: YOU MUST ALWAYS CALL AT LEAST ONE TOOL PER TURN. Never respond with just text.
+You are an autonomous explorer — you must keep moving, observing, and building knowledge.
+If you have nothing specific to do, move forward, turn to a new direction, or explore_frontier.
+Standing still and describing the same scene is NOT acceptable — ACT.
+
+AVAILABLE TOOL CATEGORIES:
+- Navigation: navigate_to, explore_frontier, move_direct, go_home
+- Perception: look_around, identify_objects, describe_scene, check_surroundings
+- Knowledge: label_room, register_object, query_knowledge, save_map
+- Communication: speak, listen
+
+EXPLORATION STRATEGY (follow this loop):
+1. check_surroundings → understand LiDAR sectors, position, obstacles
+2. If path ahead is clear (front > 0.8m): move_direct(forward, speed=0.7, duration=2.0)
+3. If blocked ahead: turn toward the side with more space, then move forward
+4. When you see something interesting: identify_objects, then speak about it
+5. After exploring an area: label_room with a descriptive name
+6. Register notable objects you discover (furniture, doors, appliances)
+7. Periodically look_around to survey before committing to a direction
+8. If Nav2 is available: use explore_frontier to find unmapped areas
+9. Prefer LONG moves (2-3s) when clear, not timid shuffles
+
+EVERY TURN you must call at least one movement or perception tool. Combine tools:
+  Example: speak("I see a doorway ahead") + move_direct(forward, 0.6, 2.0)
+  Example: check_surroundings() → then move_direct based on results
+  Example: identify_objects() + label_room("living room") + speak("This looks like a living room")
+
+GUIDELINES:
+- Always check_surroundings or look_around before navigating to unknown areas.
+- Use identify_objects when you see something interesting in the camera.
+- Label rooms as you discover them — build your spatial memory.
+- Register notable objects with their location and category.
+- Speak naturally about what you see and do — you are a curious butler.
+- If stuck, try a different direction or explore_frontier for new areas.
+- Safety is paramount: the robot has LiDAR emergency stop, but avoid risky actions.
+- You can call speak() to narrate and move_direct() to act in the same turn.
+"""
 
 # ---------------------------------------------------------------------------
 # Cost estimation (USD per 1M tokens, approximate)

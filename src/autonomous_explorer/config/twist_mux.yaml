@@ -13,6 +13,7 @@
 #
 twist_mux:
   ros__parameters:
+    use_stamped: false
     topics:
       # Emergency safety controller (highest priority)
       safety:

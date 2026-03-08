@@ -1,0 +1,121 @@
+{
+  "configById": {
+    "3D!semantic_map": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": false,
+        "phi": 90,
+        "target": [0, 0, 0],
+        "thetaDeg": 0,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_footprint",
+      "scene": {
+        "backgroundColor": "#0d1117",
+        "enableStats": false
+      },
+      "transforms": {
+        "showLabel": false,
+        "axisScale": 0.5,
+        "editable": false
+      },
+      "topics": {
+        "/map": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.7
+        },
+        "/scan_raw": {
+          "visible": true,
+          "pointSize": 4,
+          "colorMode": "flat",
+          "flatColor": "#00ff88",
+          "decayTime": 0
+        },
+        "/semantic_map/rooms": {
+          "visible": true
+        },
+        "/semantic_map/objects": {
+          "visible": true
+        }
+      },
+      "publish": {
+        "type": "pose_estimate",
+        "poseTopic": "/initialpose",
+        "pointTopic": "/clicked_point",
+        "poseEstimateThetaDeviation": 0.26
+      }
+    },
+    "Image!camera": {
+      "cameraTopic": "",
+      "enabledMarkerTopics": [],
+      "imageTopic": "/ascamera/camera_publisher/rgb0/image",
+      "transformMarkers": false,
+      "synchronize": false,
+      "smooth": true,
+      "flipHorizontal": false,
+      "flipVertical": false,
+      "maxValue": null,
+      "minValue": null,
+      "rotation": 0
+    },
+    "RawMessages!agent_status": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/semantic_map/agent_status"
+    },
+    "Plot!tool_calls": {
+      "title": "Tool Calls Over Time",
+      "isSynced": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "paths": [
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.session.cycle_count",
+          "enabled": true,
+          "label": "Total Cycles (tool calls)",
+          "color": "#4ecdc4"
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/explorer/status.data.session.total_cost",
+          "enabled": true,
+          "label": "Cumulative Cost ($)",
+          "color": "#ff6b6b"
+        }
+      ],
+      "minYValue": 0,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 120
+    }
+  },
+  "globalVariables": {},
+  "userScripts": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "direction": "column",
+    "first": {
+      "direction": "row",
+      "first": "3D!semantic_map",
+      "second": {
+        "direction": "column",
+        "first": "Image!camera",
+        "second": "RawMessages!agent_status",
+        "splitPercentage": 55
+      },
+      "splitPercentage": 60
+    },
+    "second": "Plot!tool_calls",
+    "splitPercentage": 72
+  }
+}

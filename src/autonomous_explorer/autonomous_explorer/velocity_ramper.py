@@ -88,11 +88,10 @@ class VelocityRamper:
         self._thread.start()
 
     def shutdown(self):
-        """Stop the ramper thread and zero motors."""
+        """Stop the ramper thread."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=1.0)
-        self._publish_zero()
 
     def set_target(self, linear_x: float, angular_z: float):
         """Set target velocity — ramper will smoothly approach it."""
@@ -104,19 +103,33 @@ class VelocityRamper:
             self._e_stopped = False
 
     def stop(self):
-        """Smoothly decelerate to zero."""
+        """Stop immediately (no ramp-down to avoid motor buzz from low-PWM coil energization).
+
+        Publishes exactly ONE zero Twist so the downstream node (odom_publisher
+        or twist_mux) knows to stop the motors, then goes completely silent
+        (continuous zeros cause STM32 motor coil buzz).
+
+        Guarded by _last_published so repeated calls (e.g. from
+        _run_timed_action's decel loop) don't keep publishing zeros.
+        """
         with self._lock:
             self._target_linear = 0.0
             self._target_angular = 0.0
+            self._current_linear = 0.0
+            self._current_angular = 0.0
+        # Publish exactly one zero, only if we were previously non-zero
+        if self._last_published != (0.0, 0.0):
+            self._publish_zero()
 
     def emergency_stop(self):
-        """Immediately zero all velocities (no ramp)."""
+        """Immediately zero all velocities and publish one zero Twist."""
         with self._lock:
             self._target_linear = 0.0
             self._target_angular = 0.0
             self._current_linear = 0.0
             self._current_angular = 0.0
             self._e_stopped = True
+        # Always publish zero for emergency — safety trumps buzz
         self._publish_zero()
 
     def block_forward(self):
@@ -152,10 +165,11 @@ class VelocityRamper:
                 )
 
                 if at_rest:
-                    idle_count += 1
-                    if idle_count > 10:  # after 0.5s at rest, sleep longer
-                        time.sleep(0.1)  # 10Hz idle vs 20Hz active
-                        continue
+                    # Do NOT publish zeros — STM32 PID energizes motor coils
+                    # on every received command (even zero speed), causing buzz.
+                    # Just stop publishing entirely; motors coast to stop naturally.
+                    time.sleep(0.1)
+                    continue
                 else:
                     idle_count = 0
 

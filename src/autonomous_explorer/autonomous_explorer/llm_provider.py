@@ -3,20 +3,35 @@
 """
 Provider-agnostic LLM interface for the autonomous explorer.
 
-Supports Claude (Anthropic) and OpenAI with vision capabilities.
-Both providers receive camera images + sensor context and return
-JSON action commands using the same schema.
+Supports two modes:
+  1. analyze_scene() — legacy single-action JSON mode (sense-think-act loop)
+  2. agent_turn() — ROSA-style tool-calling mode (multi-step reasoning)
 
-Usage:
+Both Claude and OpenAI providers implement native tool-calling via their
+respective APIs (Claude tool_use, OpenAI function calling), eliminating
+brittle JSON parsing. The LLM selects from predefined tool functions
+following the ROSA (NASA JPL) pattern.
+
+Usage (legacy):
     provider = create_provider("claude", api_key="sk-...")
     result = provider.analyze_scene(image_b64, system_prompt, user_prompt)
-    # result['action'], result['speed'], ...    <- parsed action
-    # result['_meta']['tokens_input'], ...      <- logging metadata
+
+Usage (agent mode):
+    provider = create_provider("openai", api_key="sk-...")
+    response = provider.agent_turn(
+        system_prompt="You are Jeeves...",
+        messages=[...],           # conversation history
+        tools=[...],              # tool definitions (from ToolRegistry)
+    )
+    for tc in response.tool_calls:
+        result = registry.execute(tc.tool_name, tc.arguments)
 """
 import json
 import re
 import time
 from abc import ABC, abstractmethod
+
+from autonomous_explorer.conversation_manager import AgentResponse, ToolCall
 
 
 class LLMProvider(ABC):
@@ -102,6 +117,95 @@ class LLMProvider(ABC):
             },
         }
 
+    def agent_turn(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 1024,
+    ) -> AgentResponse:
+        """Execute one agent turn with native tool-calling.
+
+        This is the ROSA-style interface. The LLM receives conversation
+        history (with images) and tool definitions, and returns tool
+        invocations rather than free-form JSON.
+
+        Args:
+            system_prompt: System instructions for the agent.
+            messages: Conversation history in provider-specific format
+                (use ConversationManager.get_messages()).
+            tools: Tool definitions in provider-specific format
+                (use ToolRegistry.to_claude_tools() or .to_openai_tools()).
+            max_tokens: Maximum response tokens.
+
+        Returns:
+            AgentResponse with tool_calls and/or text.
+        """
+        # Default implementation falls back to analyze_scene for providers
+        # that don't override this method.
+        return self._agent_turn_fallback(system_prompt, messages, tools)
+
+    def _agent_turn_fallback(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+    ) -> AgentResponse:
+        """Fallback: extract text from latest user message and use analyze_scene."""
+        user_text = ''
+        for msg in reversed(messages):
+            if msg.get('role') == 'user':
+                content = msg.get('content', '')
+                if isinstance(content, str):
+                    user_text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            user_text = block['text']
+                            break
+                break
+        result = self.analyze_scene('', system_prompt, user_text)
+        meta = result.pop('_meta', {})
+        # Convert the legacy action into a move_direct tool call
+        action = result.get('action', 'stop')
+        return AgentResponse(
+            tool_calls=[ToolCall(
+                tool_name='move_direct',
+                arguments={
+                    'action': action,
+                    'speed': result.get('speed', 0.0),
+                    'duration': result.get('duration', 0.0),
+                },
+                call_id='fallback_0',
+            )],
+            text=result.get('speech'),
+            raw_response=meta.get('raw_response', ''),
+            tokens_input=meta.get('tokens_input', 0),
+            tokens_output=meta.get('tokens_output', 0),
+            response_time_ms=meta.get('response_time_ms', 0),
+            stop_reason='tool_use',
+            provider=self.provider_name,
+            model=getattr(self, 'model', ''),
+        )
+
+    def _agent_error_response(self, error_msg: str) -> AgentResponse:
+        """Return a safe AgentResponse when the LLM call fails."""
+        return AgentResponse(
+            tool_calls=[ToolCall(
+                tool_name='move_direct',
+                arguments={'action': 'stop', 'speed': 0.0, 'duration': 0.0},
+                call_id='error_0',
+            )],
+            text=f'LLM error: {error_msg}',
+            raw_response=error_msg,
+            tokens_input=0,
+            tokens_output=0,
+            response_time_ms=0,
+            stop_reason='error',
+            provider=self.provider_name,
+            model=getattr(self, 'model', ''),
+        )
+
     @staticmethod
     def _attach_meta(
         parsed: dict,
@@ -184,6 +288,59 @@ class ClaudeProvider(LLMProvider):
             return self._safe_fallback(str(e))
 
 
+    def agent_turn(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 1024,
+    ) -> AgentResponse:
+        """Claude native tool-calling via the Messages API."""
+        t_start = time.monotonic()
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=messages,
+                tools=tools,
+                tool_choice={'type': 'auto'},
+            )
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+            tokens_in = getattr(response.usage, 'input_tokens', 0)
+            tokens_out = getattr(response.usage, 'output_tokens', 0)
+
+            # Parse content blocks: text and tool_use
+            tool_calls = []
+            text_parts = []
+            for block in response.content:
+                if block.type == 'text':
+                    text_parts.append(block.text)
+                elif block.type == 'tool_use':
+                    tool_calls.append(ToolCall(
+                        tool_name=block.name,
+                        arguments=block.input if isinstance(block.input, dict) else {},
+                        call_id=block.id,
+                    ))
+
+            stop_reason = response.stop_reason  # 'tool_use' or 'end_turn'
+
+            return AgentResponse(
+                tool_calls=tool_calls,
+                text='\n'.join(text_parts) if text_parts else None,
+                raw_response=str(response.content),
+                tokens_input=tokens_in,
+                tokens_output=tokens_out,
+                response_time_ms=elapsed_ms,
+                stop_reason=stop_reason or 'end_turn',
+                provider=self.provider_name,
+                model=self.model,
+            )
+        except Exception as e:
+            return self._agent_error_response(str(e))
+
+
 class OpenAIProvider(LLMProvider):
     """OpenAI GPT-4o vision provider."""
 
@@ -245,6 +402,105 @@ class OpenAIProvider(LLMProvider):
             return self._safe_fallback(str(e))
 
 
+    def agent_turn(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 1024,
+    ) -> AgentResponse:
+        """OpenAI native function-calling via the Chat Completions API."""
+        t_start = time.monotonic()
+        try:
+            # Build the messages list with system prompt prepended
+            api_messages = [{'role': 'system', 'content': system_prompt}]
+
+            # Convert image blocks from Claude format to OpenAI format
+            for msg in messages:
+                if msg['role'] == 'user' and isinstance(msg.get('content'), list):
+                    converted = []
+                    for block in msg['content']:
+                        if isinstance(block, dict):
+                            if block.get('type') == 'image':
+                                # Claude image → OpenAI image_url
+                                src = block.get('source', {})
+                                b64 = src.get('data', '')
+                                media = src.get('media_type', 'image/jpeg')
+                                converted.append({
+                                    'type': 'image_url',
+                                    'image_url': {
+                                        'url': f'data:{media};base64,{b64}',
+                                    },
+                                })
+                            elif block.get('type') == 'tool_result':
+                                # Skip tool_results in user messages (OpenAI
+                                # uses separate tool role messages)
+                                continue
+                            else:
+                                converted.append(block)
+                        else:
+                            converted.append(block)
+                    if converted:
+                        api_messages.append({
+                            'role': 'user', 'content': converted,
+                        })
+                else:
+                    api_messages.append(msg)
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=api_messages,
+                tools=tools,
+                tool_choice='auto',
+            )
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+            usage = response.usage
+            tokens_in = getattr(usage, 'prompt_tokens', 0) if usage else 0
+            tokens_out = getattr(usage, 'completion_tokens', 0) if usage else 0
+
+            choice = response.choices[0]
+            message = choice.message
+
+            # Parse tool calls
+            tool_calls = []
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    tool_calls.append(ToolCall(
+                        tool_name=tc.function.name,
+                        arguments=args,
+                        call_id=tc.id,
+                    ))
+
+            # Determine stop reason
+            finish = choice.finish_reason  # 'tool_calls', 'stop', 'length'
+            if finish == 'tool_calls':
+                stop_reason = 'tool_use'
+            elif finish == 'length':
+                stop_reason = 'max_tokens'
+            else:
+                stop_reason = 'end_turn'
+
+            return AgentResponse(
+                tool_calls=tool_calls,
+                text=message.content,
+                raw_response=str(message),
+                tokens_input=tokens_in,
+                tokens_output=tokens_out,
+                response_time_ms=elapsed_ms,
+                stop_reason=stop_reason,
+                provider=self.provider_name,
+                model=self.model,
+            )
+        except Exception as e:
+            return self._agent_error_response(str(e))
+
+
 class DryRunProvider(LLMProvider):
     """Fake provider for testing without API keys.
 
@@ -280,6 +536,31 @@ class DryRunProvider(LLMProvider):
         self.model = 'dry-run'
         self._cycle = 0
 
+    # Tool call sequences for agent mode dry-run
+    _AGENT_SEQUENCES = [
+        [
+            ToolCall('check_surroundings', {}, 'dry_0'),
+            ToolCall('speak', {'text': 'Dry run: checking my surroundings.'}, 'dry_1'),
+        ],
+        [
+            ToolCall('move_direct', {'action': 'forward', 'speed': 0.3, 'duration': 1.0}, 'dry_2'),
+            ToolCall('speak', {'text': 'Dry run: moving forward to explore.'}, 'dry_3'),
+        ],
+        [
+            ToolCall('look_around', {'speech': 'Dry run: scanning the area.'}, 'dry_4'),
+        ],
+        [
+            ToolCall('move_direct', {'action': 'turn_left', 'speed': 0.3, 'duration': 0.8}, 'dry_5'),
+        ],
+        [
+            ToolCall('explore_frontier', {'preference': 'nearest', 'speech': 'Dry run: exploring frontier.'}, 'dry_6'),
+        ],
+        [
+            ToolCall('move_direct', {'action': 'stop', 'speed': 0.0, 'duration': 0.0}, 'dry_7'),
+            ToolCall('speak', {'text': 'Dry run: pausing briefly.'}, 'dry_8'),
+        ],
+    ]
+
     def analyze_scene(
         self,
         image_base64: 'str | list[str]',
@@ -300,6 +581,31 @@ class DryRunProvider(LLMProvider):
             tokens_input=0,
             tokens_output=0,
             response_time_ms=elapsed_ms,
+            provider=self.provider_name,
+            model=self.model,
+        )
+
+    def agent_turn(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 1024,
+    ) -> AgentResponse:
+        """Dry-run agent turn — cycles through predefined tool call sequences."""
+        time.sleep(0.1)  # Simulate thinking
+        seq = self._AGENT_SEQUENCES[self._cycle % len(self._AGENT_SEQUENCES)]
+        self._cycle += 1
+        return AgentResponse(
+            tool_calls=list(seq),
+            text=None,
+            raw_response=json.dumps([
+                {'tool': tc.tool_name, 'args': tc.arguments} for tc in seq
+            ]),
+            tokens_input=0,
+            tokens_output=0,
+            response_time_ms=100,
+            stop_reason='tool_use',
             provider=self.provider_name,
             model=self.model,
         )

@@ -93,8 +93,10 @@ class VoiceIO:
                         if card_num:
                             self._cached_device = f'plughw:{card_num},0'
                             return self._cached_device
-        except Exception:
-            pass
+        except subprocess.TimeoutExpired:
+            self._log_warn("Audio device detection timed out")
+        except OSError as e:
+            self._log_warn(f"Audio device detection failed: {e}")
 
         self._cached_device = self.audio_device
         return self._cached_device
@@ -214,8 +216,8 @@ class VoiceIO:
         finally:
             try:
                 os.unlink(output_path)
-            except OSError:
-                pass
+            except OSError as e:
+                self._log_warn(f"Could not remove TTS temp file {output_path}: {e}")
 
     def _speak_espeak(self, text: str):
         """Fallback TTS using espeak."""
@@ -244,6 +246,31 @@ class VoiceIO:
     def is_speaking(self) -> bool:
         return self._speaking
 
+    def beep(self):
+        """Play a short beep to indicate end of listening."""
+        try:
+            # Generate a short 200ms 880Hz beep WAV
+            path = tempfile.mktemp(suffix='.wav', prefix='beep_')
+            import struct, wave
+            sr = 16000
+            dur = 0.2
+            n = int(sr * dur)
+            with wave.open(path, 'w') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                import math
+                samples = [int(16000 * math.sin(2 * math.pi * 880 * i / sr))
+                           for i in range(n)]
+                w.writeframes(struct.pack(f'<{n}h', *samples))
+            self._play_audio(path)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass  # Beep temp file cleanup is non-critical
+        except Exception as e:
+            self._log_warn(f"Beep generation failed: {e}")
+
     def listen_for_command(self, duration: int = 5) -> str:
         """Record and transcribe a voice command.
 
@@ -251,12 +278,13 @@ class VoiceIO:
             Transcribed command text, or empty string.
         """
         audio_path = self.record(duration)
+        self.beep()  # Indicate recording is done
         if audio_path:
             text = self.speech_to_text(audio_path)
             try:
                 os.unlink(audio_path)
-            except OSError:
-                pass
+            except OSError as e:
+                self._log_warn(f"Could not remove recording {audio_path}: {e}")
             return text
         return ''
 
@@ -294,8 +322,8 @@ class WonderEchoDetector:
         if self._serial:
             try:
                 self._serial.close()
-            except Exception:
-                pass
+            except OSError:
+                pass  # Serial port may already be closed
             self._serial = None
 
     def check_wakeup(self) -> bool:
@@ -312,8 +340,8 @@ class WonderEchoDetector:
                 if self.logger:
                     self.logger.info("Wake word detected!")
                 return True
-        except Exception:
-            pass
+        except OSError:
+            pass  # Transient serial read errors are expected
         return False
 
     @property

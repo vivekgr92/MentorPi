@@ -24,6 +24,7 @@ LAUNCH_HARDWARE="true"
 BUILD_FIRST="false"
 HYBRID_MODE="false"
 FOXGLOVE="true"
+DASHBOARD="false"
 
 # Machine/sensor defaults (override via env or flags)
 : "${MACHINE_TYPE:=MentorPi_Tank}"
@@ -55,6 +56,8 @@ Options:
                                controller). Use if they're already running.
   --no-foxglove                Disable Foxglove Bridge (remote visualization)
   --foxglove-port <port>       Foxglove Bridge port (default: 8765)
+  --dashboard                  Launch curses dashboard in foreground after startup
+  --no-dashboard               Skip dashboard (default: no dashboard)
   --hybrid                     Enable hybrid mode: SLAM + Nav2 + LLM
                                (requires install_nav2.sh first)
   --build                      Run colcon build before launching
@@ -107,6 +110,10 @@ while [[ $# -gt 0 ]]; do
             LAUNCH_HARDWARE="false"; shift ;;
         --no-foxglove)
             FOXGLOVE="false"; shift ;;
+        --dashboard)
+            DASHBOARD="true"; shift ;;
+        --no-dashboard)
+            DASHBOARD="false"; shift ;;
         --foxglove-port)
             FOXGLOVE_PORT="$2"; shift 2 ;;
         --hybrid)
@@ -201,6 +208,7 @@ echo "  Speed limits : ${MAX_LINEAR_SPEED} m/s, ${MAX_ANGULAR_SPEED} rad/s"
 echo "  Hardware     : $LAUNCH_HARDWARE"
 echo "  Sensor fusion: EKF (odom_raw + IMU → odom)"
 echo "  Foxglove     : $FOXGLOVE (port ${FOXGLOVE_PORT:-8765})"
+echo "  Dashboard    : $DASHBOARD"
 echo "  Hybrid (Nav2): $HYBRID_MODE"
 echo "=============================================="
 echo ""
@@ -411,5 +419,21 @@ echo ">>> Explorer is running! Press Ctrl+C to stop."
 echo ">>> Logs: ${EXPLORER_LOG_DIR:-~/mentorpi_explorer/logs}/"
 echo ""
 
-# Wait for all background processes
-wait
+if [[ "$DASHBOARD" == "true" ]]; then
+    # Wait for explorer node to publish /explorer/status before launching dashboard
+    echo ">>> Waiting 5s for nodes to initialize before launching dashboard..."
+    sleep 5
+    echo ">>> Launching curses dashboard (Ctrl+C exits dashboard + stops all nodes)..."
+    echo ""
+    # Run dashboard in foreground — user sees the TUI directly
+    # On exit (Ctrl+C or 'q'), the cleanup trap fires and kills everything
+    ros2 run autonomous_explorer dashboard
+else
+    echo ">>> TIP: Monitor with the dashboard in another terminal:"
+    echo ">>>   ros2 run autonomous_explorer dashboard"
+    echo ">>> Or attach to the screen session (if using jeeves_agent.launch.py):"
+    echo ">>>   screen -r jeeves_dash"
+    echo ""
+    # Wait for all background processes
+    wait
+fi
