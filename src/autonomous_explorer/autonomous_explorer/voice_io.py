@@ -5,7 +5,7 @@ Voice input/output for the autonomous explorer.
 
 Uses WonderEcho Pro USB mic+speaker via arecord/aplay,
 with OpenAI Whisper for STT and OpenAI TTS for speech synthesis.
-Falls back to espeak for offline TTS.
+Falls back to gTTS (Google Text-to-Speech) then espeak for offline TTS.
 """
 import os
 import subprocess
@@ -19,7 +19,7 @@ class VoiceIO:
 
     Uses the WonderEcho Pro hardware via standard ALSA commands.
     STT: OpenAI Whisper API
-    TTS: OpenAI TTS API with aplay for playback, espeak fallback
+    TTS: OpenAI TTS API with aplay for playback, gTTS/espeak fallback
     """
 
     def __init__(
@@ -30,6 +30,7 @@ class VoiceIO:
         stt_model: str = 'whisper-1',
         audio_device: str = 'plughw:1,0',
         sample_rate: int = 16000,
+        speak_min_interval: float = 10.0,
         logger=None,
     ):
         self.openai_api_key = openai_api_key
@@ -38,9 +39,11 @@ class VoiceIO:
         self.stt_model = stt_model
         self.audio_device = audio_device
         self.sample_rate = sample_rate
+        self.speak_min_interval = speak_min_interval
         self.logger = logger
         self._speaking = False
         self._speak_lock = threading.Lock()
+        self._last_speak_time = 0.0
 
         # Cache the detected audio device so we don't shell out on every call.
         # _find_audio_device() runs arecord -l which is slow on Pi 5.
@@ -54,7 +57,15 @@ class VoiceIO:
                 self._openai_client = openai.OpenAI(api_key=openai_api_key)
             except ImportError:
                 self._openai_available = False
-                self._log_warn("openai package not installed, using espeak")
+                self._log_warn("openai package not installed, trying gTTS")
+
+        # Check gTTS availability
+        self._gtts_available = False
+        try:
+            from gtts import gTTS as _gTTS  # noqa: F401
+            self._gtts_available = True
+        except ImportError:
+            pass
 
     def _log_info(self, msg: str):
         if self.logger:
@@ -167,15 +178,25 @@ class VoiceIO:
             self._log_error(f"STT failed: {e}")
             return ''
 
-    def speak(self, text: str, block: bool = False):
+    def speak(self, text: str, block: bool = False, force: bool = False):
         """Speak text out loud via TTS + aplay.
+
+        Rate-limited to at most one call per speak_min_interval seconds.
+        Use force=True to bypass rate limiting (for greetings, shutdown, etc.).
 
         Args:
             text: Text to speak.
             block: If True, wait for speech to finish.
+            force: If True, bypass rate limiting.
         """
         if not text:
             return
+
+        now = time.monotonic()
+        if not force and (now - self._last_speak_time) < self.speak_min_interval:
+            self._log_info(f"Speech rate-limited, skipping: {text[:60]}...")
+            return
+        self._last_speak_time = now
 
         if block:
             self._speak_impl(text)
@@ -186,14 +207,23 @@ class VoiceIO:
             thread.start()
 
     def _speak_impl(self, text: str):
-        """Internal TTS implementation."""
+        """Internal TTS implementation. Cascade: OpenAI → gTTS → espeak."""
         with self._speak_lock:
             self._speaking = True
             try:
                 if self._openai_available:
-                    self._speak_openai(text)
-                else:
-                    self._speak_espeak(text)
+                    try:
+                        self._speak_openai(text)
+                        return
+                    except Exception as e:
+                        self._log_error(f"OpenAI TTS failed: {e}, trying gTTS")
+                if self._gtts_available:
+                    try:
+                        self._speak_gtts(text)
+                        return
+                    except Exception as e:
+                        self._log_error(f"gTTS failed: {e}, trying espeak")
+                self._speak_espeak(text)
             finally:
                 self._speaking = False
 
@@ -201,33 +231,62 @@ class VoiceIO:
         """Generate speech via OpenAI TTS and play with aplay."""
         output_path = tempfile.mktemp(suffix='.wav', prefix='explorer_tts_')
         try:
-            # OpenAI TTS returns audio data
             response = self._openai_client.audio.speech.create(
                 model=self.tts_model,
                 voice=self.tts_voice,
-                input=text[:4096],  # OpenAI TTS limit
+                input=text[:4096],
                 response_format='wav',
             )
             response.write_to_file(output_path)
             self._play_audio(output_path)
-        except Exception as e:
-            self._log_error(f"OpenAI TTS failed: {e}, falling back to espeak")
-            self._speak_espeak(text)
         finally:
             try:
                 os.unlink(output_path)
             except OSError as e:
                 self._log_warn(f"Could not remove TTS temp file {output_path}: {e}")
 
+    def _speak_gtts(self, text: str):
+        """Fallback TTS using Google Text-to-Speech (gTTS)."""
+        from gtts import gTTS
+        output_path = tempfile.mktemp(suffix='.mp3', prefix='explorer_gtts_')
+        try:
+            tts = gTTS(text=text[:500], lang='en')
+            tts.save(output_path)
+            device = self._find_audio_device()
+            # mpg123/ffplay for mp3, or convert to wav first
+            try:
+                subprocess.run(
+                    ['mpg123', '-a', device, '-q', output_path],
+                    capture_output=True, timeout=30,
+                )
+            except FileNotFoundError:
+                # mpg123 not installed, convert to wav with ffmpeg
+                wav_path = output_path.replace('.mp3', '.wav')
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', output_path, '-ar', '16000',
+                     '-ac', '1', wav_path],
+                    capture_output=True, timeout=15,
+                )
+                self._play_audio(wav_path)
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
     def _speak_espeak(self, text: str):
-        """Fallback TTS using espeak."""
+        """Last-resort TTS using espeak."""
         try:
             subprocess.run(
                 ['espeak', '-s', '150', text[:500]],
                 capture_output=True, timeout=30,
             )
         except FileNotFoundError:
-            self._log_warn("espeak not installed")
+            self._log_warn("espeak not installed — no TTS available")
         except Exception as e:
             self._log_error(f"espeak failed: {e}")
 

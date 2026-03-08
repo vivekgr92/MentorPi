@@ -471,7 +471,7 @@ class ToolHandlers:
             return {'success': True, 'spoken': False, 'reason': 'voice disabled'}
 
         try:
-            self._node.voice.speak(text, block=wait)
+            self._node.voice.speak(text, block=wait, force=True)
             return {'success': True, 'spoken': True, 'text': text}
         except OSError as e:
             self._log.error(f'speak audio device error: {e}')

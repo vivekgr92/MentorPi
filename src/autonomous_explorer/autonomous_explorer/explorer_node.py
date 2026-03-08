@@ -106,6 +106,7 @@ from autonomous_explorer.config import (
     SERVO_STEP_US,
     SERVO_TILT_ID,
     SERVO_TOPIC,
+    SPEAK_MIN_INTERVAL,
     STATUS_PUBLISH_RATE,
     STATUS_TOPIC,
     STT_MODEL,
@@ -221,8 +222,8 @@ class AutonomousExplorer(Node):
         intro = self.consciousness.get_session_intro()
         self.get_logger().info(f'Jeeves: {intro}')
         if self.voice_on:
-            self.voice.speak(intro, block=True)
-            self.voice.speak('How may I assist you, Sir?', block=True)
+            self.voice.speak(intro, block=True, force=True)
+            self.voice.speak('How may I assist you, Sir?', block=True, force=True)
             self.voice.beep()
 
         self.get_logger().info(
@@ -427,6 +428,7 @@ class AutonomousExplorer(Node):
             tts_voice=TTS_VOICE,
             stt_model=STT_MODEL,
             audio_device=AUDIO_DEVICE,
+            speak_min_interval=SPEAK_MIN_INTERVAL,
             logger=self.get_logger(),
         )
         self.wake_detector = WonderEchoDetector(
@@ -1218,14 +1220,14 @@ class AutonomousExplorer(Node):
                 '>>> MANUAL MODE — joystick controls active'
             )
             if self.voice_on:
-                self.voice.speak('Switching to manual mode.')
+                self.voice.speak('Switching to manual mode.', force=True)
         else:
             self.control_mode = 'autonomous'
             self.get_logger().info(
                 '>>> AUTONOMOUS MODE — press Enter or say "start" to explore'
             )
             if self.voice_on:
-                self.voice.speak('Switching to autonomous mode. Say start to explore.')
+                self.voice.speak('Switching to autonomous mode. Say start to explore.', force=True)
 
     def _joystick_button_callback(self, button: str):
         """Handle joystick button presses (called from JoystickReader thread)."""
@@ -1340,7 +1342,7 @@ class AutonomousExplorer(Node):
         # Repeat the instruction back and proceed
         self.voice.speak(
             f'Understood, Sir. {cmd}. Right away.',
-            block=True,
+            block=True, force=True,
         )
 
         self._publish_agent_status(f'Executing: "{cmd}"')
@@ -1762,7 +1764,7 @@ class AutonomousExplorer(Node):
         self.exploring = True
         self.get_logger().info('Auto-starting exploration')
         if self.voice_on:
-            self.voice.speak('I am Jeeves, and I am ready to explore.')
+            self.voice.speak('I am Jeeves, and I am ready to explore.', force=True)
 
         while self.running:
             try:
@@ -2115,7 +2117,7 @@ class AutonomousExplorer(Node):
             self.get_logger().warning(f'Knowledge update failed: {e}')
 
         if self.voice_on:
-            self.voice.speak('Exploration complete. Shutting down.', block=True)
+            self.voice.speak('Exploration complete. Shutting down.', block=True, force=True)
         self.get_logger().info('Shutdown complete.')
 
 

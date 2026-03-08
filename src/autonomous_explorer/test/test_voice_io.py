@@ -47,17 +47,31 @@ class TestSpeak:
     @patch.object(VoiceIO, '_speak_impl')
     def test_blocking_speak_calls_impl(self, mock_impl):
         vio = VoiceIO()
-        vio.speak('Hello', block=True)
+        vio.speak('Hello', block=True, force=True)
         mock_impl.assert_called_once_with('Hello')
 
     @patch.object(VoiceIO, '_speak_impl')
     def test_nonblocking_speak_starts_thread(self, mock_impl):
         vio = VoiceIO()
-        vio.speak('Hello', block=False)
+        vio.speak('Hello', block=False, force=True)
         # Give the thread a moment
         import time
         time.sleep(0.1)
         mock_impl.assert_called_once_with('Hello')
+
+    @patch.object(VoiceIO, '_speak_impl')
+    def test_rate_limiting_skips_rapid_calls(self, mock_impl):
+        vio = VoiceIO(speak_min_interval=10.0)
+        vio.speak('First', block=True, force=True)
+        vio.speak('Second', block=True)  # Should be rate-limited
+        mock_impl.assert_called_once_with('First')
+
+    @patch.object(VoiceIO, '_speak_impl')
+    def test_force_bypasses_rate_limiting(self, mock_impl):
+        vio = VoiceIO(speak_min_interval=10.0)
+        vio.speak('First', block=True, force=True)
+        vio.speak('Second', block=True, force=True)
+        assert mock_impl.call_count == 2
 
 
 # ===================================================================
@@ -67,9 +81,17 @@ class TestSpeak:
 class TestSpeakImpl:
     """Test internal TTS implementation."""
 
-    @patch.object(VoiceIO, '_speak_espeak')
-    def test_fallback_to_espeak_when_no_openai(self, mock_espeak):
+    @patch.object(VoiceIO, '_speak_gtts')
+    def test_fallback_to_gtts_when_no_openai(self, mock_gtts):
         vio = VoiceIO(openai_api_key='')
+        vio._gtts_available = True
+        vio._speak_impl('Test')
+        mock_gtts.assert_called_once_with('Test')
+
+    @patch.object(VoiceIO, '_speak_espeak')
+    def test_fallback_to_espeak_when_no_openai_no_gtts(self, mock_espeak):
+        vio = VoiceIO(openai_api_key='')
+        vio._gtts_available = False
         vio._speak_impl('Test')
         mock_espeak.assert_called_once_with('Test')
 
@@ -117,7 +139,7 @@ class TestFindAudioDevice:
         device = vio._find_audio_device()
         assert device == 'plughw:1,0'
 
-    @patch('autonomous_explorer.voice_io.subprocess.run', side_effect=Exception("no arecord"))
+    @patch('autonomous_explorer.voice_io.subprocess.run', side_effect=OSError("no arecord"))
     def test_error_returns_default(self, mock_run):
         vio = VoiceIO(audio_device='plughw:1,0')
         device = vio._find_audio_device()
@@ -184,12 +206,13 @@ class TestListenForCommand:
 
     @patch.object(VoiceIO, 'speech_to_text', return_value='start exploring')
     @patch.object(VoiceIO, 'record', return_value='/tmp/test.wav')
+    @patch.object(VoiceIO, 'beep')
     @patch('os.unlink')
-    def test_returns_transcription(self, mock_unlink, mock_record, mock_stt):
+    def test_returns_transcription(self, mock_unlink, mock_beep, mock_record, mock_stt):
         vio = VoiceIO()
         result = vio.listen_for_command(duration=5)
         assert result == 'start exploring'
-        mock_unlink.assert_called_once()
+        mock_unlink.assert_called_once_with('/tmp/test.wav')
 
     @patch.object(VoiceIO, 'record', return_value='')
     def test_failed_recording_returns_empty(self, mock_record):

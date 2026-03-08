@@ -177,6 +177,7 @@ RECORDING_DURATION = 5           # seconds
 RECORDING_SAMPLE_RATE = 16000
 TMP_RECORDING_PATH = '/tmp/explorer_recording.wav'
 TMP_TTS_PATH = '/tmp/explorer_tts.wav'
+SPEAK_MIN_INTERVAL = 10.0        # seconds — minimum time between speak() calls (rate limit)
 
 # ---------------------------------------------------------------------------
 # Exploration memory
