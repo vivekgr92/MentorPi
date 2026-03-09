@@ -342,14 +342,19 @@ class ClaudeProvider(LLMProvider):
 
 
 class OpenAIProvider(LLMProvider):
-    """OpenAI GPT-4o vision provider."""
+    """OpenAI GPT-4o vision provider. Also used for local OpenAI-compatible servers (LM Studio, ollama, etc.)."""
 
     provider_name = 'openai'
 
-    def __init__(self, api_key: str, model: str = 'gpt-4o'):
+    def __init__(self, api_key: str, model: str = 'gpt-4o', base_url: str = ''):
         import openai
-        self.client = openai.OpenAI(api_key=api_key, timeout=20.0)
+        kwargs = {'api_key': api_key, 'timeout': 20.0}
+        if base_url:
+            kwargs['base_url'] = base_url
+            self.provider_name = 'local'
+        self.client = openai.OpenAI(**kwargs)
         self.model = model
+        self._base_url = base_url
 
     def analyze_scene(
         self,
@@ -615,13 +620,15 @@ def create_provider(
     provider_name: str,
     api_key: str,
     model: str | None = None,
+    base_url: str = '',
 ) -> LLMProvider:
     """Factory function to create an LLM provider.
 
     Args:
-        provider_name: "claude" or "openai"
+        provider_name: "claude", "openai", "local", or "dryrun"
         api_key: API key for the chosen provider.
         model: Optional model override.
+        base_url: Base URL for local OpenAI-compatible servers (LM Studio, etc.)
 
     Returns:
         An LLMProvider instance.
@@ -638,13 +645,14 @@ def create_provider(
             api_key=api_key,
             model=model or 'claude-sonnet-4-20250514',
         )
-    elif name == 'openai':
+    elif name in ('openai', 'local'):
         return OpenAIProvider(
-            api_key=api_key,
+            api_key=api_key or 'lm-studio',
             model=model or 'gpt-4o',
+            base_url=base_url,
         )
     else:
         raise ValueError(
             f"Unknown LLM provider '{provider_name}'. "
-            f"Supported: 'claude', 'openai', 'dryrun'"
+            f"Supported: 'claude', 'openai', 'local', 'dryrun'"
         )

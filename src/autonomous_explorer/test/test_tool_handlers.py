@@ -26,7 +26,7 @@ class MockVoice:
     def __init__(self):
         self.spoken = []
 
-    def speak(self, text, block=True):
+    def speak(self, text, block=True, force=False):
         self.spoken.append(text)
 
     def listen_for_command(self, duration=5):

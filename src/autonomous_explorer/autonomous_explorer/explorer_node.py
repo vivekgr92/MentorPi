@@ -127,6 +127,7 @@ from autonomous_explorer.config import (
     build_system_prompt,
 )
 from autonomous_explorer.consciousness import JeevesConsciousness
+from autonomous_explorer.model_config import ModelConfigManager
 from autonomous_explorer.nav2_bridge import NAV2_AVAILABLE
 from autonomous_explorer.world_knowledge import WorldKnowledge
 from autonomous_explorer.data_logger import DataLogger
@@ -250,6 +251,8 @@ class AutonomousExplorer(Node):
         self.declare_parameter('voice_enabled', VOICE_ENABLED)
         self.declare_parameter('use_nav2', USE_NAV2)
         self.declare_parameter('agent_mode', AGENT_MODE)
+        self.declare_parameter('model_profile', '')
+        self.declare_parameter('model_config_path', '')
 
         def _get_str(name: str) -> str:
             return self.get_parameter(name).get_parameter_value().string_value
@@ -273,6 +276,8 @@ class AutonomousExplorer(Node):
         self.voice_on = _get_bool('voice_enabled')
         self.use_nav2 = _get_bool('use_nav2')
         self.agent_mode = _get_bool('agent_mode')
+        self.model_profile = _get_str('model_profile')
+        self._model_config_path = _get_str('model_config_path')
 
     def _init_nav2(self):
         """Initialize Nav2 hybrid mode if requested and available."""
@@ -366,33 +371,59 @@ class AutonomousExplorer(Node):
         self._joystick_moving = False
 
     def _init_llm_provider(self):
-        """Create the LLM provider, falling back to dry-run if no key."""
-        if self.provider_name in ('dryrun', 'dry-run', 'dry_run'):
-            api_key = ''
-            model = 'dry-run'
-        else:
-            api_key = (
-                self.anthropic_key
-                if self.provider_name == 'claude'
-                else self.openai_key
-            )
-            model = (
-                self.claude_model
-                if self.provider_name == 'claude'
-                else self.openai_model
-            )
-            if not api_key:
-                self.get_logger().warn(
-                    f'No API key for {self.provider_name}! '
-                    f'Falling back to dry-run mode. '
-                    f'Set ANTHROPIC_API_KEY or OPENAI_API_KEY to use a real LLM.'
+        """Create the LLM provider using ModelConfigManager for fallback chain."""
+        # Find model_config.yaml — check explicit path, then package share dir
+        config_path = self._model_config_path
+        if not config_path:
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                config_path = os.path.join(
+                    get_package_share_directory('autonomous_explorer'),
+                    'config', 'model_config.yaml',
                 )
-                self.provider_name = 'dryrun'
-                model = 'dry-run'
+            except Exception:
+                config_path = os.path.join(
+                    os.path.dirname(__file__), '..', 'config', 'model_config.yaml',
+                )
 
-        self.llm = create_provider(self.provider_name, api_key, model)
+        # If profile not set via ROS param, check launch arg override of provider_name
+        profile = self.model_profile
+        if not profile and self.provider_name in ('dryrun', 'dry-run', 'dry_run'):
+            profile = 'dryrun'
+
+        self.model_config = ModelConfigManager(
+            config_path=config_path,
+            profile=profile,
+            logger=self.get_logger(),
+        )
+
+        # If provider_name was set explicitly (not default), override model_config
+        if self.provider_name and not profile:
+            self.model_config._active['llm'] = self.provider_name
+
+        self._create_llm_from_config()
+
+    def _create_llm_from_config(self):
+        """Create the LLM provider from model_config active settings."""
+        mc = self.model_config
+        provider_name = mc.get_provider_name('llm')
+        api_key = mc.get_api_key('llm')
+        model = mc.get_model('llm')
+        base_url = mc.get_base_url('llm')
+
+        if provider_name not in ('dryrun', 'local') and not api_key:
+            self.get_logger().warn(
+                f'No API key for {provider_name}! '
+                f'Falling back to dry-run mode.'
+            )
+            provider_name = 'dryrun'
+            model = 'dry-run'
+
+        self.llm = create_provider(provider_name, api_key, model, base_url)
+        self.provider_name = provider_name
         self.get_logger().info(
-            f'LLM provider: {self.provider_name} ({model})'
+            f'LLM provider: {provider_name} ({model})'
+            + (f' @ {base_url}' if base_url else '')
         )
 
     def _init_agent_mode(self):
@@ -422,13 +453,19 @@ class AutonomousExplorer(Node):
         """Initialize memory, voice, data logger, consciousness, knowledge."""
         self.memory = ExplorationMemory(MEMORY_FILE)
 
+        # Resolve TTS/STT config from model_config
+        tts_cfg = self.model_config.get_provider_config('tts')
+        stt_cfg = self.model_config.get_provider_config('stt')
+        tts_key = self.model_config.get_api_key('tts') or self.openai_key
         self.voice = VoiceIO(
-            openai_api_key=self.openai_key,
-            tts_model=TTS_MODEL,
-            tts_voice=TTS_VOICE,
-            stt_model=STT_MODEL,
+            openai_api_key=tts_key,
+            tts_model=tts_cfg.get('model', TTS_MODEL),
+            tts_voice=tts_cfg.get('voice', TTS_VOICE),
+            stt_model=stt_cfg.get('model', STT_MODEL),
             audio_device=AUDIO_DEVICE,
             speak_min_interval=SPEAK_MIN_INTERVAL,
+            tts_provider=self.model_config.get_provider_name('tts'),
+            stt_provider=self.model_config.get_provider_name('stt'),
             logger=self.get_logger(),
         )
         self.wake_detector = WonderEchoDetector(

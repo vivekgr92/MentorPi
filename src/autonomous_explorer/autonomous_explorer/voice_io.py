@@ -31,6 +31,8 @@ class VoiceIO:
         audio_device: str = 'plughw:1,0',
         sample_rate: int = 16000,
         speak_min_interval: float = 10.0,
+        tts_provider: str = 'openai',
+        stt_provider: str = 'openai',
         logger=None,
     ):
         self.openai_api_key = openai_api_key
@@ -40,6 +42,8 @@ class VoiceIO:
         self.audio_device = audio_device
         self.sample_rate = sample_rate
         self.speak_min_interval = speak_min_interval
+        self.tts_provider = tts_provider
+        self.stt_provider = stt_provider
         self.logger = logger
         self._speaking = False
         self._speak_lock = threading.Lock()
@@ -150,7 +154,7 @@ class VoiceIO:
         return ''
 
     def speech_to_text(self, audio_path: str) -> str:
-        """Transcribe audio file. Cascade: OpenAI Whisper → Google Speech Recognition.
+        """Transcribe audio file. Cascade based on stt_provider config.
 
         Args:
             audio_path: Path to WAV file.
@@ -161,24 +165,42 @@ class VoiceIO:
         if not os.path.exists(audio_path):
             return ''
 
-        # Try OpenAI Whisper first
-        if self._openai_available:
+        # Build STT chain based on configured primary
+        if self.stt_provider == 'google':
+            chain = [('google', True), ('openai', self._openai_available)]
+        else:
+            chain = [('openai', self._openai_available), ('google', True)]
+
+        for name, available in chain:
+            if not available:
+                continue
             try:
-                with open(audio_path, 'rb') as f:
-                    response = self._openai_client.audio.transcriptions.create(
-                        model=self.stt_model,
-                        file=f,
-                        language='en',
-                    )
-                text = response.text.strip()
+                if name == 'openai':
+                    text = self._stt_openai(audio_path)
+                elif name == 'google':
+                    text = self._stt_google(audio_path)
+                else:
+                    continue
                 if text:
-                    self._log_info(f"STT (OpenAI): {text}")
                     return text
             except Exception as e:
-                self._log_error(f"OpenAI STT failed: {e}, trying Google")
+                remaining = [n for n, a in chain if a and n != name]
+                next_name = remaining[0] if remaining else 'none'
+                self._log_error(f"{name} STT failed: {e}, trying {next_name}")
+        return ''
 
-        # Fallback: Google Speech Recognition (free, no API key)
-        return self._stt_google(audio_path)
+    def _stt_openai(self, audio_path: str) -> str:
+        """STT using OpenAI Whisper API."""
+        with open(audio_path, 'rb') as f:
+            response = self._openai_client.audio.transcriptions.create(
+                model=self.stt_model,
+                file=f,
+                language='en',
+            )
+        text = response.text.strip()
+        if text:
+            self._log_info(f"STT (OpenAI): {text}")
+        return text
 
     def _stt_google(self, audio_path: str) -> str:
         """Fallback STT using Google Speech Recognition (free tier)."""
@@ -227,23 +249,34 @@ class VoiceIO:
             thread.start()
 
     def _speak_impl(self, text: str):
-        """Internal TTS implementation. Cascade: OpenAI → gTTS → espeak."""
+        """Internal TTS implementation. Cascade based on tts_provider config."""
         with self._speak_lock:
             self._speaking = True
             try:
-                if self._openai_available:
+                # Build fallback chain based on configured primary
+                if self.tts_provider == 'gtts':
+                    chain = [('gtts', self._gtts_available), ('openai', self._openai_available), ('espeak', True)]
+                elif self.tts_provider == 'espeak':
+                    chain = [('espeak', True), ('gtts', self._gtts_available)]
+                else:
+                    chain = [('openai', self._openai_available), ('gtts', self._gtts_available), ('espeak', True)]
+
+                for name, available in chain:
+                    if not available:
+                        continue
                     try:
-                        self._speak_openai(text)
+                        if name == 'openai':
+                            self._speak_openai(text)
+                        elif name == 'gtts':
+                            self._speak_gtts(text)
+                        elif name == 'espeak':
+                            self._speak_espeak(text)
                         return
                     except Exception as e:
-                        self._log_error(f"OpenAI TTS failed: {e}, trying gTTS")
-                if self._gtts_available:
-                    try:
-                        self._speak_gtts(text)
-                        return
-                    except Exception as e:
-                        self._log_error(f"gTTS failed: {e}, trying espeak")
-                self._speak_espeak(text)
+                        remaining = [n for n, a in chain if a and n != name]
+                        next_name = remaining[0] if remaining else 'none'
+                        self._log_error(f"{name} TTS failed: {e}, trying {next_name}")
+                self._log_warn("All TTS providers failed")
             finally:
                 self._speaking = False
 

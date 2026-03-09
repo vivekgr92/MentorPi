@@ -79,6 +79,11 @@ def generate_launch_description():
             default_value=os.environ.get('AGENT_MODE', 'false'),
             description='Enable ROSA-style tool-calling agent mode',
         ),
+        DeclareLaunchArgument(
+            'model_profile',
+            default_value='',
+            description='Model config profile: cloud, local, hybrid, budget, dryrun',
+        ),
 
         # Autonomous Explorer node
         Node(
@@ -95,6 +100,7 @@ def generate_launch_description():
                     'max_linear_speed': LaunchConfiguration('max_linear_speed'),
                     'max_angular_speed': LaunchConfiguration('max_angular_speed'),
                     'agent_mode': LaunchConfiguration('agent_mode'),
+                    'model_profile': LaunchConfiguration('model_profile'),
                 },
             ],
         ),

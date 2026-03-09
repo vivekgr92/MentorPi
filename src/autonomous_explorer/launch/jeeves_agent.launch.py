@@ -116,6 +116,11 @@ def generate_launch_description():
             default_value='true',
             description='Launch curses dashboard in a detached screen session (attach: screen -r jeeves_dash)',
         ),
+        DeclareLaunchArgument(
+            'model_profile',
+            default_value='',
+            description='Model config profile: cloud, local, hybrid, budget, dryrun (empty=use defaults)',
+        ),
     ]
 
     hw_condition = IfCondition(LaunchConfiguration('hardware'))
@@ -472,6 +477,7 @@ def generate_launch_description():
                 'llm_provider': LaunchConfiguration('llm_provider'),
                 'voice_enabled': LaunchConfiguration('voice_enabled'),
                 'loop_interval': LaunchConfiguration('loop_interval'),
+                'model_profile': LaunchConfiguration('model_profile'),
                 'use_nav2': True,
                 'agent_mode': True,
             },

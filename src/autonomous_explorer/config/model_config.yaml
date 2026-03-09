@@ -1,0 +1,105 @@
+# Model configuration for Jeeves autonomous explorer.
+#
+# Switch providers via launch arg:
+#   ros2 launch autonomous_explorer jeeves_agent.launch.py model_profile:=local
+#
+# Profiles override the primary provider for each service.
+# Fallback chain is tried automatically on errors (429, timeout, connection refused).
+
+# ──────────────────────────────────────────────────────────────
+# LLM (vision + reasoning)
+# ──────────────────────────────────────────────────────────────
+llm:
+  primary: openai
+  fallback: local
+  providers:
+    openai:
+      model: gpt-4o
+      api_key_env: OPENAI_API_KEY
+    claude:
+      model: claude-sonnet-4-20250514
+      api_key_env: ANTHROPIC_API_KEY
+    local:
+      base_url: "http://10.0.0.176:1234/v1"
+      model: qwen2.5-vl-7b-instruct
+      api_key: lm-studio
+
+# ──────────────────────────────────────────────────────────────
+# TTS (text-to-speech)
+# ──────────────────────────────────────────────────────────────
+tts:
+  primary: openai
+  fallback: gtts
+  providers:
+    openai:
+      model: tts-1
+      voice: onyx
+      api_key_env: OPENAI_API_KEY
+    gtts: {}
+    espeak: {}
+
+# ──────────────────────────────────────────────────────────────
+# STT (speech-to-text)
+# ──────────────────────────────────────────────────────────────
+stt:
+  primary: openai
+  fallback: google
+  providers:
+    openai:
+      model: whisper-1
+      api_key_env: OPENAI_API_KEY
+    google: {}
+
+# ──────────────────────────────────────────────────────────────
+# VLM (vision-language model — used by identify_objects, describe_scene tools)
+# Falls back independently of the main LLM.
+# ──────────────────────────────────────────────────────────────
+vlm:
+  primary: openai
+  fallback: claude
+  providers:
+    openai:
+      model: gpt-4o
+      api_key_env: OPENAI_API_KEY
+    claude:
+      model: claude-sonnet-4-20250514
+      api_key_env: ANTHROPIC_API_KEY
+    local:
+      base_url: "http://10.0.0.176:1234/v1"
+      model: qwen2.5-vl-7b-instruct
+      api_key: lm-studio
+
+# ──────────────────────────────────────────────────────────────
+# Named profiles — override primary providers per-service.
+# Use via: model_profile:=<name>
+# ──────────────────────────────────────────────────────────────
+profiles:
+  cloud:
+    llm: openai
+    tts: openai
+    stt: openai
+    vlm: openai
+
+  local:
+    llm: local
+    tts: gtts
+    stt: google
+    vlm: local
+
+  hybrid:
+    llm: openai
+    tts: gtts
+    stt: google
+    vlm: openai
+
+  budget:
+    llm: claude
+    tts: gtts
+    stt: google
+    vlm: claude
+
+  dryrun:
+    llm: dryrun
+    tts: gtts
+    stt: google
+    vlm: dryrun
