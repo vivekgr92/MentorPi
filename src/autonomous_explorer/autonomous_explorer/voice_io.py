@@ -150,7 +150,7 @@ class VoiceIO:
         return ''
 
     def speech_to_text(self, audio_path: str) -> str:
-        """Transcribe audio file using OpenAI Whisper.
+        """Transcribe audio file. Cascade: OpenAI Whisper → Google Speech Recognition.
 
         Args:
             audio_path: Path to WAV file.
@@ -158,24 +158,44 @@ class VoiceIO:
         Returns:
             Transcribed text, or empty string on failure.
         """
-        if not self._openai_available:
-            self._log_warn("STT unavailable: no OpenAI API key")
-            return ''
         if not os.path.exists(audio_path):
             return ''
 
+        # Try OpenAI Whisper first
+        if self._openai_available:
+            try:
+                with open(audio_path, 'rb') as f:
+                    response = self._openai_client.audio.transcriptions.create(
+                        model=self.stt_model,
+                        file=f,
+                        language='en',
+                    )
+                text = response.text.strip()
+                if text:
+                    self._log_info(f"STT (OpenAI): {text}")
+                    return text
+            except Exception as e:
+                self._log_error(f"OpenAI STT failed: {e}, trying Google")
+
+        # Fallback: Google Speech Recognition (free, no API key)
+        return self._stt_google(audio_path)
+
+    def _stt_google(self, audio_path: str) -> str:
+        """Fallback STT using Google Speech Recognition (free tier)."""
         try:
-            with open(audio_path, 'rb') as f:
-                response = self._openai_client.audio.transcriptions.create(
-                    model=self.stt_model,
-                    file=f,
-                    language='en',
-                )
-            text = response.text.strip()
-            self._log_info(f"STT result: {text}")
+            import speech_recognition as sr
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(audio_path) as source:
+                audio = recognizer.record(source)
+            text = recognizer.recognize_google(audio, language='en-US')
+            text = text.strip()
+            self._log_info(f"STT (Google): {text}")
             return text
+        except ImportError:
+            self._log_warn("speech_recognition package not installed")
+            return ''
         except Exception as e:
-            self._log_error(f"STT failed: {e}")
+            self._log_error(f"Google STT failed: {e}")
             return ''
 
     def speak(self, text: str, block: bool = False, force: bool = False):

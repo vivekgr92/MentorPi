@@ -184,17 +184,43 @@ class TestRecord:
 # ===================================================================
 
 class TestSpeechToText:
-    """Test STT via Whisper API."""
-
-    def test_stt_unavailable_without_key(self):
-        vio = VoiceIO(openai_api_key='')
-        result = vio.speech_to_text('/tmp/test.wav')
-        assert result == ''
+    """Test STT cascade: OpenAI Whisper → Google Speech Recognition."""
 
     def test_stt_missing_file_returns_empty(self):
         vio = VoiceIO(openai_api_key='')
         result = vio.speech_to_text('/tmp/nonexistent_file.wav')
         assert result == ''
+
+    @patch.object(VoiceIO, '_stt_google', return_value='hello')
+    def test_stt_falls_back_to_google_without_openai(self, mock_google):
+        vio = VoiceIO(openai_api_key='')
+        # Create a minimal WAV file for os.path.exists check
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            f.write(b'\x00' * 100)
+            path = f.name
+        try:
+            result = vio.speech_to_text(path)
+            assert result == 'hello'
+            mock_google.assert_called_once_with(path)
+        finally:
+            os.unlink(path)
+
+    @patch.object(VoiceIO, '_stt_google', return_value='fallback text')
+    def test_stt_falls_back_to_google_on_openai_error(self, mock_google):
+        vio = VoiceIO(openai_api_key='')
+        vio._openai_available = True
+        vio._openai_client = MagicMock()
+        vio._openai_client.audio.transcriptions.create.side_effect = Exception("429 quota")
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            f.write(b'\x00' * 100)
+            path = f.name
+        try:
+            result = vio.speech_to_text(path)
+            assert result == 'fallback text'
+        finally:
+            os.unlink(path)
 
 
 # ===================================================================
