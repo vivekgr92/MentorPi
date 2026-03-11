@@ -39,22 +39,20 @@ class ToolHandlers:
         self._log = node.get_logger()
 
     def bind_to_registry(self, registry) -> None:
-        """Bind all handler methods to their tool definitions in the registry."""
+        """Bind the 7 demo tool handlers to the registry.
+
+        Removed tools (move_direct, look_around, describe_scene,
+        check_surroundings, register_object, save_map, listen) still
+        exist as methods but are not registered — the LLM cannot call them.
+        """
         bindings = {
             'navigate_to': self.navigate_to,
             'explore_frontier': self.explore_frontier,
-            'move_direct': self.move_direct,
             'go_home': self.go_home,
-            'look_around': self.look_around,
             'identify_objects': self.identify_objects,
-            'describe_scene': self.describe_scene,
-            'check_surroundings': self.check_surroundings,
             'label_room': self.label_room,
-            'register_object': self.register_object,
             'query_knowledge': self.query_knowledge,
-            'save_map': self.save_map,
             'speak': self.speak,
-            'listen': self.listen,
         }
         for name, handler in bindings.items():
             tool = registry.get_tool(name)
@@ -151,12 +149,42 @@ class ToolHandlers:
         if not accepted:
             return {'success': False, 'error': 'Nav2 goal not accepted'}
 
-        return {
-            'success': True,
-            'status': 'navigating',
-            'goal': goal,
-            'alternatives': len(frontiers) - 1,
-        }
+        # Wait for navigation with timeout, return for LLM re-evaluation periodically
+        t_start = time.time()
+        while (self._node.nav2.is_navigating
+               and self._node.running
+               and time.time() - t_start < NAV2_TOOL_TIMEOUT):
+            if self._node.emergency_stop:
+                self._node.nav2.cancel_navigation()
+                return {'success': False, 'error': 'Emergency stop during frontier exploration'}
+            # Return after interval so LLM can re-evaluate
+            if time.time() - t_start >= NAV2_TOOL_REEVAL_INTERVAL:
+                fb = self._node.nav2.navigation_feedback or {}
+                return {
+                    'success': True,
+                    'status': 'in_progress',
+                    'goal': goal,
+                    'distance_remaining': fb.get('distance_remaining', '?'),
+                    'alternatives': len(frontiers) - 1,
+                }
+            time.sleep(0.5)
+
+        # Navigation completed or timed out
+        result = self._node.nav2.navigation_result
+        if result == 'succeeded':
+            return {
+                'success': True,
+                'status': 'arrived',
+                'goal': goal,
+                'alternatives': len(frontiers) - 1,
+            }
+        else:
+            return {
+                'success': False,
+                'status': result or 'timeout',
+                'goal': goal,
+                'error': f'Frontier navigation {result or "timed out"}',
+            }
 
     def move_direct(self, action: str, speed: float, duration: float) -> dict:
         """Direct motor control for short movements."""
@@ -200,67 +228,165 @@ class ToolHandlers:
         }
 
     def identify_objects(self, focus_area: str = 'all') -> dict:
-        """Analyze the current camera frame to detect objects."""
+        """Detect objects, auto-register in knowledge graph, and describe scene.
+
+        Tries VLM cloud first, falls back to local YOLO.
+        Auto-registers detected objects in the current room's knowledge graph.
+        Returns objects list + scene description + room guess.
+        """
+        objects = []
+        source = 'none'
+        room_guess = 'unknown'
+        description = ''
+
+        # Try VLM first (cloud API call)
         image_b64 = self._node._get_camera_frame_b64()
-        if not image_b64:
-            return {'success': False, 'error': 'No camera frame available'}
-
-        prompt = (
-            'List all visible objects with approximate distances and positions '
-            '(left/center/right). For each object provide: name, distance_estimate, '
-            'position_in_frame. Respond in JSON: {"objects": [{"name": "...", '
-            '"distance": "...", "position": "..."}]}'
-        )
-        if focus_area != 'all':
-            prompt += f' Focus on the {focus_area} portion of the image.'
-
-        try:
-            result = self._node.llm.analyze_scene(
-                image_b64,
-                'You are a robot vision system. Identify objects precisely. Respond in JSON only.',
-                prompt,
+        if image_b64:
+            prompt = (
+                'Analyze this image from a robot camera. Respond in JSON:\n'
+                '{"objects": [{"name": "...", "distance": "...", "position": "left|center|right"}],\n'
+                ' "description": "2-3 sentence scene description",\n'
+                ' "room_guess": "kitchen|bedroom|bathroom|living room|office|hallway|unknown"}'
             )
-            meta = result.pop('_meta', {})
-            return {
-                'success': True,
-                'objects': result.get('objects', []),
-                'raw': result,
-            }
-        except (ConnectionError, TimeoutError) as e:
-            self._log.error(f'identify_objects network error: {e}')
-            return {'success': False, 'error': str(e)}
-        except Exception as e:
-            self._log.error(f'identify_objects failed: {e}')
-            return {'success': False, 'error': str(e)}
+            if focus_area != 'all':
+                prompt += f'\nFocus on the {focus_area} portion of the image.'
+            try:
+                result = self._node.llm.analyze_scene(
+                    image_b64,
+                    'You are a robot vision system. Identify objects and describe the scene. Respond in JSON only.',
+                    prompt,
+                )
+                result.pop('_meta', {})
+                objects = result.get('objects', [])
+                description = result.get('description', '')
+                room_guess = result.get('room_guess', 'unknown')
+                source = 'vlm_cloud'
+            except Exception as e:
+                self._log.warn(f'VLM failed, falling back to YOLO: {e}')
+
+        # Fallback: YOLO local (~200ms, free)
+        if not objects and self._node.yolo:
+            with self._node._rgb_lock:
+                rgb = self._node._rgb_image.copy() if self._node._rgb_image is not None else None
+            with self._node._depth_lock:
+                depth = self._node._depth_image.copy() if self._node._depth_image is not None else None
+            if rgb is None:
+                return {'success': False, 'error': 'No camera frame available'}
+            try:
+                from autonomous_explorer.yolo_detector import YoloDetector
+                detections = self._node.yolo.detect(rgb, depth)
+                if focus_area != 'all' and focus_area in ('left', 'center', 'right'):
+                    detections = [d for d in detections if d.position == focus_area]
+                objects = YoloDetector.detections_to_dict(detections)
+                obj_names = [d.label for d in detections]
+                unique_objs = list(dict.fromkeys(obj_names))
+                room_guess = self._guess_room(unique_objs)
+                if detections:
+                    description = f'I see {len(detections)} objects: {", ".join(unique_objs)}.'
+                else:
+                    description = 'No distinct objects detected in view.'
+                source = 'yolo_local'
+                self._log.info(
+                    f'YOLO identify_objects: {len(objects)} objects '
+                    f'({self._node.yolo.last_inference_ms:.0f}ms)')
+            except Exception as e:
+                self._log.error(f'YOLO fallback also failed: {e}')
+                return {'success': False, 'error': str(e)}
+
+        if not objects and source == 'none':
+            return {'success': False, 'error': 'No camera frame and no YOLO detector available'}
+
+        # Auto-register detected objects in the knowledge graph
+        odom = self._get_odom()
+        now = datetime.now().isoformat(timespec='seconds')
+        registered = []
+        for obj in objects:
+            name = (obj.get('name') or '').lower().strip()
+            if name and name not in ('unknown', 'object'):
+                try:
+                    self._node.world_knowledge._update_object(
+                        name, now, odom, category='detected')
+                    registered.append(name)
+                except Exception:
+                    pass
+        if registered:
+            self._node.world_knowledge.save()
+            self._log.info(f'Auto-registered objects: {registered}')
+
+        return {
+            'success': True,
+            'objects': objects,
+            'description': description,
+            'room_guess': room_guess,
+            'registered': registered,
+            'source': source,
+        }
 
     def describe_scene(self) -> dict:
-        """Get a natural language description of the current camera view."""
+        """Describe the scene using VLM cloud, falling back to local YOLO."""
+        # Try VLM first (cloud API call)
         image_b64 = self._node._get_camera_frame_b64()
-        if not image_b64:
-            return {'success': False, 'error': 'No camera frame available'}
+        if image_b64:
+            try:
+                result = self._node.llm.analyze_scene(
+                    image_b64,
+                    'You are a robot describing what you see. Be concise and specific.',
+                    'Describe this scene in 2-3 sentences. What room might this be? '
+                    'What notable objects, features, or hazards do you see? '
+                    'Respond in JSON: {"description": "...", "room_guess": "...", '
+                    '"hazards": []}',
+                )
+                meta = result.pop('_meta', {})
+                return {
+                    'success': True,
+                    'description': result.get('description', ''),
+                    'room_guess': result.get('room_guess', ''),
+                    'hazards': result.get('hazards', []),
+                    'source': 'vlm_cloud',
+                }
+            except Exception as e:
+                self._log.warn(f'VLM failed, falling back to YOLO: {e}')
 
-        try:
-            result = self._node.llm.analyze_scene(
-                image_b64,
-                'You are a robot describing what you see. Be concise and specific.',
-                'Describe this scene in 2-3 sentences. What room might this be? '
-                'What notable objects, features, or hazards do you see? '
-                'Respond in JSON: {"description": "...", "room_guess": "...", '
-                '"hazards": []}',
-            )
-            meta = result.pop('_meta', {})
-            return {
-                'success': True,
-                'description': result.get('description', ''),
-                'room_guess': result.get('room_guess', ''),
-                'hazards': result.get('hazards', []),
-            }
-        except (ConnectionError, TimeoutError) as e:
-            self._log.error(f'describe_scene network error: {e}')
-            return {'success': False, 'error': str(e)}
-        except Exception as e:
-            self._log.error(f'describe_scene failed: {e}')
-            return {'success': False, 'error': str(e)}
+        # Fallback: YOLO-based description (local, free)
+        if self._node.yolo:
+            with self._node._rgb_lock:
+                rgb = self._node._rgb_image.copy() if self._node._rgb_image is not None else None
+            with self._node._depth_lock:
+                depth = self._node._depth_image.copy() if self._node._depth_image is not None else None
+            if rgb is not None:
+                try:
+                    detections = self._node.yolo.detect(rgb, depth)
+                    lidar = self._get_lidar_sectors()
+                    obj_names = [d.label for d in detections]
+                    unique_objs = list(dict.fromkeys(obj_names))
+                    if detections:
+                        desc = f'I can see {len(detections)} objects: {", ".join(unique_objs)}.'
+                        close = [d for d in detections if 0 < d.distance_m < 1.0]
+                        if close:
+                            desc += f' Nearby: {", ".join(d.label for d in close)}.'
+                    else:
+                        desc = 'No distinct objects detected in view.'
+                    if lidar:
+                        front = lidar.get('front', 0)
+                        desc += f' Front clearance: {front:.1f}m.'
+
+                    room_guess = self._guess_room(unique_objs)
+                    hazards = [d.label for d in detections
+                               if d.label in ('knife', 'scissors', 'fire hydrant')
+                               or (0 < d.distance_m < 0.3)]
+
+                    return {
+                        'success': True,
+                        'description': desc,
+                        'room_guess': room_guess,
+                        'hazards': hazards,
+                        'source': 'yolo_local',
+                    }
+                except Exception as e:
+                    self._log.error(f'YOLO fallback also failed: {e}')
+                    return {'success': False, 'error': str(e)}
+
+        return {'success': False, 'error': 'No camera frame and no YOLO detector available'}
 
     def check_surroundings(self) -> dict:
         """Get a sensor summary without moving."""
@@ -510,11 +636,29 @@ class ToolHandlers:
         with self._node._lidar_lock:
             return self._node._lidar_ranges.copy() if self._node._lidar_ranges else None
 
+    @staticmethod
+    def _guess_room(object_names: list[str]) -> str:
+        """Guess room type from detected object names."""
+        names = set(o.lower() for o in object_names)
+        if names & {'oven', 'microwave', 'refrigerator', 'sink', 'toaster'}:
+            return 'kitchen'
+        if names & {'toilet', 'sink'} and not names & {'oven', 'refrigerator'}:
+            return 'bathroom'
+        if names & {'bed', 'pillow'}:
+            return 'bedroom'
+        if names & {'couch', 'tv', 'remote', 'sofa'}:
+            return 'living room'
+        if names & {'laptop', 'keyboard', 'mouse', 'monitor'}:
+            return 'office'
+        if names & {'dining table', 'wine glass', 'fork', 'knife', 'spoon'}:
+            return 'dining room'
+        return 'unknown'
+
     def _speak_async(self, text: str):
         """Speak without blocking the tool execution."""
         if self._node.voice_on and text:
             try:
-                self._node.voice.speak(text, block=False)
+                self._node.voice.speak(text, block=False, force=True)
             except OSError as e:
                 self._log.warning(f'Async speak audio error: {e}')
             except Exception as e:

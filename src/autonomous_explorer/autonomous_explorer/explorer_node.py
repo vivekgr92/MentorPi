@@ -49,6 +49,7 @@ from nav_msgs.msg import Odometry
 from autonomous_explorer.config import (
     AGENT_ERROR_SLEEP,
     AGENT_IDLE_SLEEP,
+    AGENT_LLM_MIN_INTERVAL,
     AGENT_MAX_TOOL_ROUNDS,
     AGENT_MODE,
     AGENT_SYSTEM_PROMPT,
@@ -87,6 +88,8 @@ from autonomous_explorer.config import (
     LOG_LEVEL,
     LOOP_INTERVAL,
     MAX_ANGULAR_SPEED,
+    LOCAL_JPEG_QUALITY,
+    LOCAL_MAX_IMAGE_DIMENSION,
     MAX_IMAGE_DIMENSION,
     MAX_LINEAR_SPEED,
     MEMORY_FILE,
@@ -124,6 +127,12 @@ from autonomous_explorer.config import (
     USE_TWIST_MUX,
     VOICE_ENABLED,
     WONDERECHO_PORT,
+    YOLO_CONFIDENCE_THRESHOLD,
+    YOLO_ENABLED,
+    YOLO_INPUT_SIZE,
+    YOLO_MAX_DETECTIONS,
+    YOLO_MODEL_PATH,
+    YOLO_TEXT_ONLY_LOCAL,
     build_system_prompt,
 )
 from autonomous_explorer.consciousness import JeevesConsciousness
@@ -431,6 +440,7 @@ class AutonomousExplorer(Node):
         self._tool_registry = None
         self._tool_handlers = None
         self._conversation = None
+        self._agent_log = None
 
         if not self.agent_mode:
             return
@@ -438,11 +448,19 @@ class AutonomousExplorer(Node):
         from autonomous_explorer.tool_registry import create_registry
         from autonomous_explorer.tool_handlers import ToolHandlers
         from autonomous_explorer.conversation_manager import ConversationManager
+        from autonomous_explorer.agent_logger import AgentLogger
 
         self._tool_registry = create_registry()
         self._tool_handlers = ToolHandlers(self)
         self._tool_handlers.bind_to_registry(self._tool_registry)
-        self._conversation = ConversationManager(max_turns=5)
+        # Local models have smaller context — keep fewer turns
+        max_turns = 2 if self.provider_name == 'local' else 5
+        self._conversation = ConversationManager(max_turns=max_turns)
+
+        self._agent_log = AgentLogger(
+            logger=self.get_logger(),
+            publish_fn=self._publish_agent_status,
+        )
 
         self.get_logger().info(
             f'AGENT MODE: {len(self._tool_registry._tools)} tools registered '
@@ -496,6 +514,22 @@ class AutonomousExplorer(Node):
             knowledge_dir=KNOWLEDGE_DIR,
             logger=self.get_logger(),
         )
+
+        # YOLO local object detector (lazy-loaded on first use)
+        self.yolo = None
+        if YOLO_ENABLED:
+            try:
+                from autonomous_explorer.yolo_detector import YoloDetector
+                self.yolo = YoloDetector(
+                    model_path=YOLO_MODEL_PATH,
+                    confidence_threshold=YOLO_CONFIDENCE_THRESHOLD,
+                    max_detections=YOLO_MAX_DETECTIONS,
+                    input_size=YOLO_INPUT_SIZE,
+                )
+                self.get_logger().info(
+                    f'YOLO detector initialized (lazy load): {YOLO_MODEL_PATH}')
+            except Exception as e:
+                self.get_logger().warn(f'YOLO detector unavailable: {e}')
 
     def _init_publishers_and_rampers(self):
         """Set up ROS2 publishers and velocity rampers."""
@@ -961,9 +995,12 @@ class AutonomousExplorer(Node):
                 return ''
             img = self._rgb_image.copy()
 
-        # Resize if needed
+        # Resize — use smaller dimensions for local models
+        is_local = getattr(self, 'provider_name', '') == 'local'
+        max_dim = LOCAL_MAX_IMAGE_DIMENSION if is_local else MAX_IMAGE_DIMENSION
+        jpeg_q = LOCAL_JPEG_QUALITY if is_local else CAMERA_JPEG_QUALITY
+
         h, w = img.shape[:2]
-        max_dim = MAX_IMAGE_DIMENSION
         if max(h, w) > max_dim:
             scale = max_dim / max(h, w)
             img = cv2.resize(
@@ -973,7 +1010,7 @@ class AutonomousExplorer(Node):
 
         _, jpeg_buf = cv2.imencode(
             '.jpg', img,
-            [cv2.IMWRITE_JPEG_QUALITY, CAMERA_JPEG_QUALITY],
+            [cv2.IMWRITE_JPEG_QUALITY, jpeg_q],
         )
         return base64.b64encode(jpeg_buf).decode('utf-8')
 
@@ -1350,6 +1387,8 @@ class AutonomousExplorer(Node):
                         self.get_logger().info(
                             f'STT result: "{command}" (len={len(command)})')
                         if command:
+                            if self._agent_log:
+                                self._agent_log.voice_received(command)
                             self._voice_queue.put(command)
                             self.get_logger().info(
                                 f'Voice command queued: {command}')
@@ -1458,6 +1497,21 @@ class AutonomousExplorer(Node):
         with self._odom_lock:
             odom = self._odom_data.copy() if self._odom_data else None
 
+        # Run YOLO detection on the RGB frame
+        yolo_detections = []
+        yolo_text = ''
+        if self.yolo and rgb is not None:
+            try:
+                yolo_detections = self.yolo.detect(rgb, depth)
+                from autonomous_explorer.yolo_detector import YoloDetector
+                yolo_text = YoloDetector.detections_to_text(yolo_detections)
+                if yolo_detections:
+                    self.get_logger().info(
+                        f'YOLO: {len(yolo_detections)} objects detected '
+                        f'({self.yolo.last_inference_ms:.0f}ms)')
+            except Exception as e:
+                self.get_logger().warn(f'YOLO detection failed: {e}')
+
         return {
             'rgb': rgb,
             'depth': depth,
@@ -1469,6 +1523,8 @@ class AutonomousExplorer(Node):
             'depth_summary': self._get_depth_summary(),
             'lidar_summary': self._get_lidar_summary(),
             'memory_context': self.memory.get_context_summary(),
+            'yolo_detections': yolo_detections,
+            'yolo_text': yolo_text,
         }
 
     def _build_sensor_context(self, sensors: dict) -> tuple[str, str, str, str | None]:
@@ -1915,8 +1971,12 @@ class AutonomousExplorer(Node):
 
                 cycle_start = time.time()
                 self._cycle_count += 1
+                if self._agent_log:
+                    self._agent_log.turn_start(self._cycle_count)
 
                 # SENSE + BUILD CONTEXT
+                # Capture voice instruction before _prepare_agent_context clears it
+                voice_for_log = self._pending_voice_instruction
                 ctx = self._prepare_agent_context()
                 if ctx is None:
                     time.sleep(1.0)
@@ -1926,11 +1986,17 @@ class AutonomousExplorer(Node):
 
                 # REACT LOOP
                 response, turn_cost = self._run_agent_turn(
-                    system_prompt, messages, tools)
+                    system_prompt, messages, tools,
+                    voice_instruction=voice_for_log)
 
                 # FINALIZE
                 self._finalize_agent_turn(
                     response, turn_cost, sensors, cycle_start)
+
+                # Throttle between turns for local models
+                elapsed = time.time() - cycle_start
+                if elapsed < AGENT_LLM_MIN_INTERVAL:
+                    time.sleep(AGENT_LLM_MIN_INTERVAL - elapsed)
 
             except Exception as e:
                 self.get_logger().error(
@@ -1967,6 +2033,11 @@ class AutonomousExplorer(Node):
             odom=sensors.get('odom'),
         )
 
+        # Add YOLO detections to sensor context
+        yolo_text = sensors.get('yolo_text', '')
+        if yolo_text:
+            sensor_context += f'\n\n{yolo_text}'
+
         user_text = f'{identity_context}\n\n{sensor_context}'
 
         if self._pending_voice_instruction:
@@ -1979,9 +2050,25 @@ class AutonomousExplorer(Node):
                 f'Injecting voice instruction: {self._pending_voice_instruction}')
             self._pending_voice_instruction = None
 
+        # Decide whether to send image or text-only to LLM
+        # Local models: text-only (YOLO detections replace image) to avoid context overflow
+        # Cloud models: still send image (large context windows)
+        is_local = self.provider_name == 'local'
+        skip_image = is_local and YOLO_TEXT_ONLY_LOCAL and yolo_text
+        image_b64 = '' if skip_image else sensors.get('image_b64', '')
+
         self._conversation.add_user_message(
-            user_text, image_b64=sensors.get('image_b64', ''),
+            user_text, image_b64=image_b64,
         )
+        if skip_image:
+            self.get_logger().info(
+                f'Text-only mode: {len(sensors.get("yolo_detections", []))} '
+                f'YOLO detections sent instead of image')
+        elif image_b64:
+            img_kb = len(image_b64) * 3 // 4 // 1024
+            self.get_logger().info(f'Camera image attached to LLM turn ({img_kb} KB)')
+        else:
+            self.get_logger().warn('No camera image available for LLM turn')
 
         system_prompt = build_system_prompt(AGENT_SYSTEM_PROMPT)
 
@@ -1996,18 +2083,24 @@ class AutonomousExplorer(Node):
         return sensors, system_prompt, messages, tools
 
     def _run_agent_turn(self, system_prompt: str, messages: list,
-                        tools: list):
+                        tools: list, *,
+                        voice_instruction: str | None = None):
         """Execute the ReAct tool-calling loop for one agent turn.
 
         Returns (last_response, total_turn_cost).
         """
         turn_cost = 0.0
         turn_start = time.time()
+        last_llm_call = 0.0
         rounds = 0
         response = None
+        spoke_this_turn = False
+        total_tools_executed = 0
         provider = self.provider_name
 
-        while rounds < AGENT_MAX_TOOL_ROUNDS:
+        # Local models overflow after ~3 tool rounds
+        max_rounds = 2 if provider == 'local' else AGENT_MAX_TOOL_ROUNDS
+        while rounds < max_rounds:
             if time.time() - turn_start > AGENT_TURN_TIMEOUT:
                 self.get_logger().warn('Agent turn timeout')
                 break
@@ -2015,13 +2108,73 @@ class AutonomousExplorer(Node):
             if not self.running or self.emergency_stop:
                 break
 
-            rounds += 1
+            # Throttle LLM calls — local models need time between requests
+            elapsed = time.time() - last_llm_call
+            if elapsed < AGENT_LLM_MIN_INTERVAL and last_llm_call > 0:
+                wait = AGENT_LLM_MIN_INTERVAL - elapsed
+                self.get_logger().debug(
+                    f'LLM throttle: waiting {wait:.1f}s')
+                time.sleep(wait)
 
+            rounds += 1
+            last_llm_call = time.time()
+
+            # --- Agent log: LLM request ---
+            if self._agent_log:
+                # Check if any message contains an image
+                has_image = False
+                for msg in messages:
+                    content = msg.get('content', '')
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get('type') in (
+                                'image_url', 'image',
+                            ):
+                                has_image = True
+                                break
+                    if has_image:
+                        break
+                self._agent_log.llm_request(
+                    provider=provider,
+                    num_tools=len(tools),
+                    num_messages=len(messages),
+                    has_image=has_image,
+                    voice_instruction=(
+                        voice_instruction if rounds == 1 else None),
+                )
+
+            llm_call_start = time.monotonic()
             response = self.llm.agent_turn(
                 system_prompt=system_prompt,
                 messages=messages,
                 tools=tools,
             )
+
+            # --- Agent log: LLM response ---
+            if self._agent_log:
+                self._agent_log.llm_response(
+                    num_tool_calls=len(response.tool_calls),
+                    stop_reason=response.stop_reason,
+                    response_ms=response.response_time_ms,
+                    tokens_in=response.tokens_input,
+                    tokens_out=response.tokens_output,
+                )
+
+            # LLM error — stop exploration and alert user
+            if response.text and response.text.startswith('LLM error'):
+                error_msg = response.text
+                self.get_logger().error(
+                    f'LLM FAILED: {error_msg}\n'
+                    f'Stopping exploration. Relaunch with a different provider:\n'
+                    f'  ros2 launch autonomous_explorer jeeves_agent.launch.py '
+                    f'model_profile:=local')
+                self._stop_motors()
+                if self.voice_on:
+                    self.voice.speak(
+                        'My brain connection failed. Please relaunch me '
+                        'with a local model.', block=False, force=True)
+                self._exploring = False
+                return response, 0.0
 
             cost = self._estimate_cost(
                 response.tokens_input, response.tokens_output)
@@ -2054,19 +2207,64 @@ class AutonomousExplorer(Node):
                 ],
             )
 
+            # Limit to one movement tool per LLM response to prevent
+            # conflicting commands (no sensor update between movements).
+            MOVEMENT_TOOLS = {
+                'move_direct', 'navigate_to', 'explore_frontier',
+                'go_home', 'look_around',
+            }
+            movement_executed = False
+
             tool_results = []
             for tc in response.tool_calls:
                 self.get_logger().info(
                     f'  Tool: {tc.tool_name}({_summarize_args(tc.arguments)})'
                 )
+
+                # Look up timeout for agent log
+                tool_timeout = 30.0
+                if self._agent_log and self._tool_registry:
+                    tool_def = self._tool_registry._tools.get(tc.tool_name)
+                    if tool_def:
+                        tool_timeout = tool_def.timeout_s
+                    self._agent_log.tool_start(
+                        tc.tool_name, tc.arguments, tool_timeout)
+
+                tool_t0 = time.monotonic()
                 try:
-                    result = self._tool_registry.execute(
-                        tc.tool_name, tc.arguments)
+                    if tc.tool_name in MOVEMENT_TOOLS and movement_executed:
+                        self.get_logger().warn(
+                            f'  Skipping {tc.tool_name} — movement '
+                            f'already executed this response')
+                        result = {
+                            'success': False,
+                            'error': ('Only one movement tool allowed per '
+                                      'response. Call this in the next turn.'),
+                        }
+                    else:
+                        result = self._tool_registry.execute(
+                            tc.tool_name, tc.arguments)
+                        if tc.tool_name in MOVEMENT_TOOLS:
+                            movement_executed = True
+
+                    tool_dur_ms = int((time.monotonic() - tool_t0) * 1000)
+                    if self._agent_log:
+                        self._agent_log.tool_result(
+                            tc.tool_name,
+                            success=result.get('success', False),
+                            duration_ms=tool_dur_ms,
+                            summary=_summarize_result(result),
+                        )
                 except Exception as e:
+                    tool_dur_ms = int((time.monotonic() - tool_t0) * 1000)
                     result = {'success': False, 'error': str(e)}
                     self.get_logger().error(
                         f'  Tool error: {tc.tool_name}: {e}')
+                    if self._agent_log:
+                        self._agent_log.tool_error(
+                            tc.tool_name, str(e), tool_dur_ms)
 
+                total_tools_executed += 1
                 self.get_logger().info(
                     f'  Result: {_summarize_result(result)}')
                 tool_results.append({
@@ -2074,6 +2272,8 @@ class AutonomousExplorer(Node):
                     'name': tc.tool_name,
                     'result': result,
                 })
+                if tc.tool_name == 'speak':
+                    spoke_this_turn = True
 
             self._conversation.add_tool_results(tool_results)
 
@@ -2084,6 +2284,20 @@ class AutonomousExplorer(Node):
 
             if response.stop_reason in ('end_turn', 'stop'):
                 break
+
+        # Auto-speak: if the LLM produced text but never called speak(),
+        # narrate the reasoning so the robot isn't silent.
+        if (response and response.text and not spoke_this_turn
+                and not response.text.startswith('LLM error')):
+            speech = response.text[:200].rsplit('.', 1)[0] + '.'
+            if len(speech) > 10:
+                self.voice.speak(speech, block=False)
+
+        # --- Agent log: turn complete ---
+        if self._agent_log:
+            total_dur = time.time() - turn_start
+            self._agent_log.turn_complete(
+                total_tools_executed, total_dur, turn_cost)
 
         return response, turn_cost
 

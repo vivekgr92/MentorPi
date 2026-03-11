@@ -19,6 +19,8 @@ setup(
         (os.path.join('share', package_name, 'scripts'),
             glob(os.path.join('scripts', '*.py')) +
             glob(os.path.join('scripts', '*.sh'))),
+        (os.path.join('share', package_name, 'models'),
+            glob(os.path.join('models', '*.onnx'))),
     ],
     install_requires=[
         'setuptools',

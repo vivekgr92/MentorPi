@@ -348,8 +348,9 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, api_key: str, model: str = 'gpt-4o', base_url: str = ''):
         import openai
-        kwargs = {'api_key': api_key, 'timeout': 20.0}
-        if base_url:
+        is_local = bool(base_url)
+        kwargs = {'api_key': api_key, 'timeout': 90.0 if is_local else 20.0}
+        if is_local:
             kwargs['base_url'] = base_url
             self.provider_name = 'local'
         self.client = openai.OpenAI(**kwargs)
@@ -416,41 +417,16 @@ class OpenAIProvider(LLMProvider):
     ) -> AgentResponse:
         """OpenAI native function-calling via the Chat Completions API."""
         t_start = time.monotonic()
+        # Local models have smaller context — use fewer output tokens
+        if self._base_url:
+            max_tokens = min(max_tokens, 512)
         try:
-            # Build the messages list with system prompt prepended
+            # Build the messages list with system prompt prepended.
+            # Note: images are already in OpenAI format (image_url) —
+            # conversion from Claude format happens in
+            # ConversationManager.get_messages_openai().
             api_messages = [{'role': 'system', 'content': system_prompt}]
-
-            # Convert image blocks from Claude format to OpenAI format
-            for msg in messages:
-                if msg['role'] == 'user' and isinstance(msg.get('content'), list):
-                    converted = []
-                    for block in msg['content']:
-                        if isinstance(block, dict):
-                            if block.get('type') == 'image':
-                                # Claude image → OpenAI image_url
-                                src = block.get('source', {})
-                                b64 = src.get('data', '')
-                                media = src.get('media_type', 'image/jpeg')
-                                converted.append({
-                                    'type': 'image_url',
-                                    'image_url': {
-                                        'url': f'data:{media};base64,{b64}',
-                                    },
-                                })
-                            elif block.get('type') == 'tool_result':
-                                # Skip tool_results in user messages (OpenAI
-                                # uses separate tool role messages)
-                                continue
-                            else:
-                                converted.append(block)
-                        else:
-                            converted.append(block)
-                    if converted:
-                        api_messages.append({
-                            'role': 'user', 'content': converted,
-                        })
-                else:
-                    api_messages.append(msg)
+            api_messages.extend(messages)
 
             response = self.client.chat.completions.create(
                 model=self.model,

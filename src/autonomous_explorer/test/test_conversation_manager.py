@@ -302,6 +302,25 @@ class TestOpenAIRendering:
         assert len(cm.get_messages('claude')) == 1
         assert len(cm.get_messages('openai')) == 1
 
+    def test_images_converted_to_openai_format(self):
+        cm = ConversationManager()
+        cm.add_user_message('What do you see?', image_b64='abc123')
+        msgs = cm.get_messages_openai()
+        content = msgs[0]['content']
+        assert isinstance(content, list)
+        img_block = content[0]
+        assert img_block['type'] == 'image_url'
+        assert img_block['image_url']['url'] == 'data:image/jpeg;base64,abc123'
+        assert content[1]['type'] == 'text'
+
+    def test_images_stay_claude_format_for_claude(self):
+        cm = ConversationManager()
+        cm.add_user_message('What do you see?', image_b64='abc123')
+        msgs = cm.get_messages_claude()
+        content = msgs[0]['content']
+        assert content[0]['type'] == 'image'
+        assert content[0]['source']['data'] == 'abc123'
+
 
 # ===================================================================
 # ConversationManager — add_assistant_tool_calls (legacy)

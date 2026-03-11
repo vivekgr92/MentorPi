@@ -1,4 +1,6 @@
 """Tests for autonomous_explorer.tool_registry module."""
+import time
+
 import pytest
 
 from autonomous_explorer.tool_registry import (
@@ -116,6 +118,70 @@ class TestToolRegistry:
         result = reg.execute('boom', {})
         assert result['success'] is False
         assert 'kaboom' in result['error']
+
+
+# ===================================================================
+# Timeout enforcement in execute()
+# ===================================================================
+
+class TestExecuteTimeout:
+    """Verify that ToolRegistry.execute() enforces per-tool timeout_s."""
+
+    def test_fast_tool_returns_normally(self):
+        """A handler that completes within timeout_s returns its result."""
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name='fast',
+            description='Completes quickly',
+            parameters={'type': 'object', 'properties': {}},
+            handler=lambda: {'success': True, 'value': 42},
+            timeout_s=5.0,
+        ))
+        result = reg.execute('fast', {})
+        assert result == {'success': True, 'value': 42}
+
+    def test_slow_tool_returns_timeout_error(self):
+        """A handler that exceeds timeout_s returns a timeout error dict."""
+        def slow_handler():
+            time.sleep(10)
+            return {'success': True}
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name='slow',
+            description='Takes too long',
+            parameters={'type': 'object', 'properties': {}},
+            handler=slow_handler,
+            timeout_s=0.2,
+        ))
+        start = time.monotonic()
+        result = reg.execute('slow', {})
+        elapsed = time.monotonic() - start
+
+        assert result['success'] is False
+        assert result['timed_out'] is True
+        assert 'timed out' in result['error']
+        assert 'slow' in result['error']
+        # Should return after ~0.2s, not 10s
+        assert elapsed < 2.0
+
+    def test_exception_in_handler_returns_error(self):
+        """A handler that raises still returns an error dict (not a timeout)."""
+        def exploding_handler():
+            raise ValueError('sensor disconnected')
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name='explode',
+            description='Raises an exception',
+            parameters={'type': 'object', 'properties': {}},
+            handler=exploding_handler,
+            timeout_s=5.0,
+        ))
+        result = reg.execute('explode', {})
+        assert result['success'] is False
+        assert 'sensor disconnected' in result['error']
+        assert 'timed_out' not in result
 
 
 # ===================================================================

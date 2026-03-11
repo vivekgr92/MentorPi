@@ -11,7 +11,7 @@
 # ──────────────────────────────────────────────────────────────
 llm:
   primary: openai
-  fallback: local
+  fallback: none
   providers:
     openai:
       model: gpt-4o

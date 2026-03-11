@@ -50,12 +50,14 @@ These must be set before launching nodes:
 
 Autonomous explorer additional env vars:
 
-- `LLM_PROVIDER` — `claude` or `openai` (default: `claude`)
+- `LLM_PROVIDER` — `claude` or `openai` (default: `openai`)
 - `ANTHROPIC_API_KEY` — API key for Claude
-- `OPENAI_API_KEY` — API key for OpenAI (also used for TTS/STT regardless of LLM provider)
+- `OPENAI_API_KEY` — API key for OpenAI (primary for LLM, TTS, STT, VLM)
 - `VOICE_ENABLED` — `true` or `false` (default: `true`)
 - `EXPLORER_LOG_LEVEL` — `full`, `compact`, or `minimal` (default: `full`)
 - `EXPLORER_LOG_DIR` — Log directory (default: `~/mentorpi_explorer/logs`)
+- `YOLO_ENABLED` — `true` or `false` (default: `true`) — local YOLO11n object detection
+- `YOLO_MODEL_PATH` — path to ONNX model (default: `models/yolo11n.onnx` in package)
 
 ## Architecture
 
@@ -123,55 +125,74 @@ Custom package that uses LLM vision (Claude or OpenAI) as the robot's brain for 
 
 ### Architecture
 
-Single ROS2 node running a continuous **sense -> think -> act -> speak** loop:
+Single ROS2 node running a ROSA-style tool-calling agent loop:
 
-1. **SENSE** — Subscribes to RGB camera, depth camera, and LiDAR
-2. **THINK** — Encodes camera frame as base64 JPEG, combines with LiDAR sector distances + depth samples + exploration memory, sends to LLM vision API
-3. **ACT** — Executes movement commands (Twist on `/controller/cmd_vel`), controls camera servos for look_around
-4. **SPEAK** — Announces observations via OpenAI TTS + aplay through WonderEcho Pro
-5. **SAFETY** — LiDAR emergency stop (20cm threshold) overrides all LLM decisions in real-time
+1. **SENSE** — Subscribes to RGB camera, depth camera, and LiDAR. Runs YOLO11n locally on each frame (~200ms on Pi 5).
+2. **THINK** — Sends sensor context + camera image (cloud) or YOLO text detections (local) + conversation history to LLM with 7 tools via native tool-calling API.
+3. **ACT** — LLM calls tools (navigate, identify, label, speak, etc.). Tool handlers bridge to Nav2, VLM, WorldKnowledge, VoiceIO.
+4. **SPEAK** — Announces observations via OpenAI TTS + aplay through WonderEcho Pro (gTTS fallback).
+5. **SAFETY** — LiDAR emergency stop (20cm threshold) overrides all LLM decisions in real-time.
+
+**Camera is fixed** — no pan/tilt servos. Robot spins on tracks to look around.
 
 ### Files
 
 ```
 src/autonomous_explorer/
 ├── autonomous_explorer/
-│   ├── config.py              # All config: env vars, topics, safety thresholds, servo IDs, logging, named constants
+│   ├── config.py              # All config: env vars, topics, safety thresholds, YOLO settings, agent prompt, named constants
 │   ├── llm_provider.py        # Provider abstraction with token usage tracking (_meta dict)
-│   ├── explorer_node.py       # Main ROS2 node: modular __init__, refactored into focused helpers (see below)
+│   ├── explorer_node.py       # Main ROS2 node: agent loop, sensor snapshot, YOLO integration
+│   ├── tool_registry.py       # ToolDefinition dataclass, ToolRegistry (timeout-enforced), 7 tool JSON schemas
+│   ├── tool_handlers.py       # ToolHandlers class: 7 bound handlers + unbound legacy handlers
+│   ├── conversation_manager.py # 5-turn sliding window, dual Claude/OpenAI rendering, context builders
+│   ├── yolo_detector.py       # YOLO11n ONNX inference, depth-fused distance, text/dict formatters
 │   ├── joystick_reader.py     # Pygame joystick reader (daemon thread, 50Hz, SHANWAN/WirelessGamepad)
 │   ├── data_logger.py         # Async JSONL logger: background thread, frame saving, compression
-│   ├── voice_io.py            # VoiceIO (arecord + Whisper STT + OpenAI TTS), WonderEchoDetector
-│   ├── exploration_memory.py  # Rolling action log, discovery tracker, stuck detection, shared speech_contains_discovery()
+│   ├── voice_io.py            # VoiceIO (arecord + Whisper STT + OpenAI TTS + gTTS fallback), WonderEchoDetector
+│   ├── agent_logger.py        # Synchronous agent logger: ROS2 rosout + /semantic_map/agent_status for Foxglove
+│   ├── exploration_memory.py  # Rolling action log, discovery tracker, stuck detection
 │   └── semantic_map_publisher.py # Publishes MarkerArray from WorldKnowledge for Foxglove 3D visualization
+├── models/
+│   └── yolo11n.onnx           # YOLO11n ONNX model (~11MB, exported from ultralytics)
 ├── scripts/
 │   ├── analytics_dashboard.py # Post-session analysis: charts, stats, path map, provider comparison
 │   └── dataset_export.py      # Export to CSV, imitation learning pairs, HuggingFace format
-├── config/explorer_params.yaml
+├── config/
+│   ├── model_config.yaml      # Provider profiles: cloud, local, hybrid, budget, dryrun
+│   └── explorer_params.yaml   # Explorer node defaults
 ├── launch/explorer.launch.py
 ├── package.xml, setup.py, setup.cfg
 ```
 
-### Multi-LLM Support
+### Multi-LLM Support & Model Config
 
-Switch providers via `LLM_PROVIDER` env var or launch arg:
+Provider switching via `model_config.yaml` profiles or launch args:
 
 ```bash
-# Claude (default)
-ros2 launch autonomous_explorer explorer.launch.py llm_provider:=claude
+# Cloud (default) — OpenAI for everything
+ros2 launch autonomous_explorer jeeves_agent.launch.py
 
-# OpenAI
-ros2 launch autonomous_explorer explorer.launch.py llm_provider:=openai
+# Local — LM Studio on 10.0.0.176 (qwen2.5-vl-7b) + gTTS + Google STT
+ros2 launch autonomous_explorer jeeves_agent.launch.py model_profile:=local
+
+# Hybrid — OpenAI LLM+VLM, free TTS/STT
+ros2 launch autonomous_explorer jeeves_agent.launch.py model_profile:=hybrid
+
+# Budget — Claude LLM+VLM, free TTS/STT
+ros2 launch autonomous_explorer jeeves_agent.launch.py model_profile:=budget
+
+# Dry-run — no API keys needed
+ros2 launch autonomous_explorer jeeves_agent.launch.py model_profile:=dryrun
 ```
 
-Both providers use the same JSON response schema:
-```json
-{"action": "forward|backward|turn_left|turn_right|spin_left|spin_right|stop|look_around|investigate",
- "speed": 0.0-1.0, "duration": 0.5-3.0,
- "speech": "what the robot says", "reasoning": "why this action"}
-```
+**`config/model_config.yaml`** defines per-service providers (llm, tts, stt, vlm) with primary+fallback chains:
+- **LLM**: OpenAI GPT-4o primary, **no fallback** (hard error → stops exploration, tells user to relaunch with `model_profile:=local`)
+- **TTS**: OpenAI TTS-1 primary → gTTS fallback → espeak fallback
+- **STT**: OpenAI Whisper primary → Google Speech Recognition fallback
+- **VLM**: OpenAI GPT-4o primary → Claude Sonnet fallback (for `identify_objects`)
 
-Adding a new provider: subclass `LLMProvider` in `llm_provider.py`, implement `analyze_scene()`, register in `create_provider()`.
+Adding a new provider: subclass `LLMProvider` in `llm_provider.py`, implement `analyze_scene()` + `agent_turn()`, register in `create_provider()`.
 
 ### Safety Mechanisms
 
@@ -254,14 +275,29 @@ Exports to: CSV (flattened, pandas-ready), imitation learning pairs (observation
 ### Dependencies
 
 ```bash
-pip install anthropic openai
+pip install anthropic openai ultralytics onnxruntime
 # Optional for analytics charts:
 pip install matplotlib
 ```
 
+### YOLO11n Local Object Detection
+
+Local YOLO11n runs on every camera frame (~200ms on Pi 5 CPU, ~200MB RAM). Detections are fused with depth camera for distance estimation.
+
+**Perception cascade** (used by `identify_objects` tool):
+1. **VLM (cloud)** — primary. Sends camera frame to GPT-4o / Claude for rich object descriptions.
+2. **YOLO (local)** — fallback if VLM fails. Returns object labels + confidence + bbox + depth-fused distance.
+
+**Text-only mode for local LLMs**: When `YOLO_TEXT_ONLY_LOCAL=True` (default) and provider is `local`, camera images are NOT sent to the LLM. Instead, YOLO detections are injected as text (~150 tokens vs 2000-4000 token base64 images), preventing context overflow on small models.
+
+**Key files:**
+- `yolo_detector.py` — `YoloDetector` class: lazy ONNX load, `detect()`, `detections_to_text()`, `_estimate_distance()`
+- `models/yolo11n.onnx` — 11MB ONNX model (exported via `ultralytics` from `yolo11n.pt`)
+- `config.py` — `YOLO_ENABLED`, `YOLO_MODEL_PATH`, `YOLO_CONFIDENCE_THRESHOLD=0.4`, `YOLO_INPUT_SIZE=640`
+
 ### Jeeves Agent Architecture (ROSA-style Tool-Calling)
 
-The explorer is evolving from a single-action-per-cycle loop into a ROSA-style tool-calling agent where the LLM can invoke multiple typed tools per turn, enabling multi-step reasoning.
+ROSA-style tool-calling agent where the LLM invokes typed tools per turn, enabling multi-step reasoning.
 
 #### Architecture Decision Records
 
@@ -270,27 +306,24 @@ The explorer is evolving from a single-action-per-cycle loop into a ROSA-style t
 | ADR-1 | Single node with tool dispatch (not multi-node) | Pi 5 CPU budget tight with Nav2+SLAM. Zero extra IPC. |
 | ADR-2 | Native tool-calling (Claude tool_use / OpenAI functions) | Eliminates brittle JSON parsing. LLM chains multiple tools per turn. |
 | ADR-3 | slam_toolbox instead of RTAbMap | 2D LiDAR only, less CPU/RAM, map serialization for persistence. |
-| ADR-4 | Cloud VLM for object detection (no local YOLO) | LLM already sees camera frame — detection is "free" per cycle. |
+| ADR-4 | VLM primary + YOLO11n fallback for perception | Cloud VLM gives rich descriptions; local YOLO (~200ms) provides reliable fallback + text-only mode for local LLMs. |
 | ADR-5 | 5-turn sliding conversation window | Multi-turn context for task continuity, <10K tokens/call. |
+| ADR-6 | 7 tools for hackathon (reduced from 14) | Eliminates overlap, reduces LLM confusion. `identify_objects` auto-registers. Camera is fixed (no pan/tilt). |
 
-#### Tool API (14 tools)
+#### Tool API (7 tools — hackathon demo set)
 
 | Category | Tool | Implementation |
 |----------|------|----------------|
 | Navigation | `navigate_to` | WorldKnowledge room lookup → Nav2Bridge.navigate_to() |
-| Navigation | `explore_frontier` | Nav2Bridge.get_frontier_goals() → navigate to nearest |
-| Navigation | `move_direct` | Wraps `_execute_action()` with safety info |
+| Navigation | `explore_frontier` | Nav2Bridge.get_frontier_goals() → navigate to nearest. **Waits** for Nav2 (polls 0.5s, returns `in_progress` after 8s for LLM re-evaluation). |
 | Navigation | `go_home` | Delegates to `navigate_to(x=0, y=0)` |
-| Perception | `look_around` | Wraps `_look_around_sequence()` |
-| Perception | `identify_objects` | VLM call on camera frame for object detection |
-| Perception | `describe_scene` | VLM call for natural language scene description |
-| Perception | `check_surroundings` | Returns LiDAR, depth, odom, map stats, battery |
+| Perception | `identify_objects` | VLM (cloud) primary → YOLO (local) fallback. Auto-registers objects in WorldKnowledge. Returns objects + scene description + room type guess. |
 | Knowledge | `label_room` | Updates WorldKnowledge rooms + stores odom position |
-| Knowledge | `register_object` | Updates WorldKnowledge objects with category/location |
 | Knowledge | `query_knowledge` | Queries rooms, objects, connections by type |
-| Knowledge | `save_map` | Saves WorldKnowledge + calls slam_toolbox save service |
 | Communication | `speak` | Wraps VoiceIO.speak() |
-| Communication | `listen` | Wraps VoiceIO.listen_for_command() |
+
+**Removed tools** (handlers still exist in `tool_handlers.py` but NOT registered):
+`move_direct` (Nav2 handles all movement), `look_around` (camera fixed), `describe_scene` (merged into `identify_objects`), `check_surroundings` (LiDAR data in prompt context), `register_object` (auto-registration in `identify_objects`), `save_map` (should auto-save), `listen` (voice handled by wake word pipeline).
 
 #### Core Loop Change
 
@@ -298,8 +331,8 @@ Old: `sense -> think -> single JSON action -> speak` (one action per cycle)
 New: `sense -> think -> [tool_call, ...] -> tool_results -> optional follow-up` (multi-step per turn)
 
 The agent loop (`_agent_loop()`) implements a full ReAct cycle per turn, decomposed into focused helpers:
-1. **`_prepare_agent_context()`** — snapshot sensors, build conversation messages with sensor+identity+knowledge context, handle voice instruction injection
-2. **`_run_agent_turn()`** — call LLM with tools via native tool-calling API, execute tool dispatch loop (up to `AGENT_MAX_TOOL_ROUNDS` rounds)
+1. **`_prepare_agent_context()`** — snapshot sensors (incl. YOLO detections), build conversation messages with sensor+identity+knowledge context, handle voice instruction injection. For local models with `YOLO_TEXT_ONLY_LOCAL`, skips image and injects YOLO text instead.
+2. **`_run_agent_turn()`** — call LLM with tools via native tool-calling API, execute tool dispatch loop (up to `AGENT_MAX_TOOL_ROUNDS=3` rounds, `AGENT_TURN_TIMEOUT=30s`). **Movement limiter**: only 1 movement tool (`navigate_to`, `explore_frontier`, `go_home`, `move_direct`, `look_around`) per LLM response — additional movement calls return an error prompting LLM to re-evaluate after sensors refresh. On LLM hard failure: stops motors, stops exploration, speaks error, logs relaunch instructions.
 3. **`_finalize_agent_turn()`** — update dashboard, consciousness, stuck watchdog, loop timing
 
 Similarly, action execution is decomposed:
@@ -328,22 +361,27 @@ ros2 launch autonomous_explorer explorer.launch.py agent_mode:=true
 AGENT_MODE=true ros2 run autonomous_explorer explorer_node
 ```
 
-#### New/Modified Files
+#### Key Agent Files
 
 ```
 src/autonomous_explorer/autonomous_explorer/
-  tool_registry.py           # ToolDefinition dataclass, ToolRegistry, 14 tool JSON schemas
-  tool_handlers.py           # ToolHandlers class: 14 handler methods bridging LLM → robot
+  tool_registry.py           # ToolDefinition dataclass, ToolRegistry (timeout-enforced via ThreadPoolExecutor), 7 tool JSON schemas
+  tool_handlers.py           # ToolHandlers class: 7 bound handlers + unbound legacy handlers, VLM→YOLO cascade, auto-registration
   conversation_manager.py    # 5-turn sliding window, dual Claude/OpenAI rendering, context builders
+  yolo_detector.py           # YoloDetector: ONNX inference, depth-fused distance, text/dict formatters
   llm_provider.py            # agent_turn() on Claude/OpenAI/DryRun providers (native tool-calling)
-  explorer_node.py           # _agent_loop() + _init_agent_mode() (feature-flagged via agent_mode param)
-  config.py                  # AGENT_MODE, AGENT_SYSTEM_PROMPT, AGENT_MAX_TOOL_ROUNDS, AGENT_TURN_TIMEOUT
+  explorer_node.py           # _agent_loop() + _init_agent_mode(), YOLO integration in _snapshot_sensors(), LLM hard-fail, movement limiter
+  agent_logger.py            # AgentLogger: synchronous structured logging to ROS2 rosout + /semantic_map/agent_status
+  config.py                  # AGENT_MODE, AGENT_SYSTEM_PROMPT (7 tools), YOLO_*, model_config.yaml profiles
   semantic_map_publisher.py  # Reads WorldKnowledge JSON, publishes MarkerArray + agent_status
+models/
+  yolo11n.onnx               # YOLO11n ONNX model (~11MB)
 launch/
   explorer.launch.py         # Legacy single-action mode + agent_mode launch arg
   jeeves_agent.launch.py     # Full stack: slam_toolbox + Nav2 + EKF + twist_mux + foxglove + rosbridge + semantic map + agent
   hybrid_explorer.launch.py  # Legacy RTAbMap-based hybrid (pre-agent)
 config/
+  model_config.yaml          # Per-service provider config: llm, tts, stt, vlm with primary+fallback + named profiles
   slam_toolbox_params.yaml   # slam_toolbox async config (tuned for Pi 5 + LD19)
   nav2_explorer_params.yaml  # Nav2 DWB controller + NavFn planner + costmaps
   ekf.yaml                   # robot_localization EKF (odom_raw + IMU → odom)
@@ -418,11 +456,11 @@ Two layouts available. Import in Foxglove Studio via **Layout > Import from file
 
 #### Semantic Map Visualization
 
-Real-time visualization of Jeeves's spatial knowledge. Room and object labels appear on the 3D map as Jeeves explores and calls `label_room()` / `register_object()`.
+Real-time visualization of Jeeves's spatial knowledge. Room and object labels appear on the 3D map as Jeeves explores. Objects are auto-registered by `identify_objects()`, rooms by `label_room()`.
 
 **Data flow:**
 ```
-label_room() / register_object() in tool_handlers.py
+label_room() / identify_objects() (auto-register) in tool_handlers.py
   → world_knowledge.save() → ~/mentorpi_explorer/knowledge/*.json
     → semantic_map_publisher.py reads (1Hz file mtime check)
       → publishes MarkerArray on /semantic_map/rooms + /semantic_map/objects
@@ -459,8 +497,8 @@ label_room() / register_object() in tool_handlers.py
 | slam_toolbox | 10-15% | 200-400 MB |
 | Nav2 (6 nodes) | 15-25% | 400-800 MB |
 | Support (EKF, twist_mux, foxglove) | 6-10% | 75 MB |
-| Jeeves agent node | 5-10% | 100-200 MB |
-| **Total** | **48-79%** | **~1.0-1.6 GB** |
+| Jeeves agent node (incl. YOLO11n ONNX) | 10-20% | 300-400 MB |
+| **Total** | **53-89%** | **~1.1-1.8 GB** |
 
 #### Hackathon Demo Script (5 min)
 
@@ -476,16 +514,19 @@ Full hackathon demo verified across 3 areas. **Status: DEMO-READY, no blocking i
 
 ##### Voice-to-LLM Pipeline — VERIFIED
 
-Complete path: WonderEcho wake word → serial packet → `_voice_listener_loop()` → `arecord` 5s → OpenAI Whisper STT → `_process_voice_command()` keyword dispatch → free-form fallback sets `_pending_voice_instruction` → `_agent_loop()` injects as `** VOICE INSTRUCTION FROM MASTER: "..." **` into user prompt → added to `ConversationManager` with sensor context + identity context + camera image → sent to `agent_turn()` with all 14 tools.
+Complete path: WonderEcho wake word → serial packet → `_voice_listener_loop()` → `arecord` 5s → OpenAI Whisper STT (Google fallback) → `_process_voice_command()` keyword dispatch → free-form fallback sets `_pending_voice_instruction` → `_agent_loop()` injects as `** VOICE INSTRUCTION FROM MASTER: "..." **` into user prompt → added to `ConversationManager` with sensor context + identity context + camera image → sent to `agent_turn()` with 7 tools.
 
 No gaps: unknown voice commands (e.g., "find me something to drink") correctly bypass the keyword dispatch table and reach the LLM in agent mode.
 
 ##### Agent Reasoning & Tool Chain — VERIFIED
 
-- All 14 tools registered with correct JSON schemas (Claude `tool_use` + OpenAI functions format)
-- All 14 handlers implemented and bound in `ToolHandlers.bind_to_registry()`
-- ReAct loop: up to `AGENT_MAX_TOOL_ROUNDS=5` rounds per turn, `AGENT_TURN_TIMEOUT=30s`
+- 7 tools registered with correct JSON schemas (Claude `tool_use` + OpenAI functions format)
+- 7 handlers bound in `ToolHandlers.bind_to_registry()` (legacy handlers still exist but unbound)
+- ToolRegistry enforces per-tool `timeout_s` via `concurrent.futures.ThreadPoolExecutor`
+- ReAct loop: up to `AGENT_MAX_TOOL_ROUNDS=3` rounds per turn, `AGENT_TURN_TIMEOUT=30s`
 - Multi-tool chain verified: `explore_frontier()` → `identify_objects()` → `label_room()` → `query_knowledge()` → `navigate_to()` → `speak()` can execute sequentially across rounds
+- `identify_objects` auto-registers detected objects in WorldKnowledge (VLM primary → YOLO fallback)
+- LLM hard failure: if GPT-4o fails, stops motors, speaks error, tells user to relaunch with `model_profile:=local`
 - `ConversationManager`: 5-turn sliding window, supports images, tool call/result pairs, dual Claude/OpenAI rendering
 - `WorldKnowledge`: persists rooms/objects/behaviors to `~/mentorpi_explorer/knowledge/*.json`, loads on startup, survives restart
 - `Consciousness`: persists lifetime stats to `~/mentorpi_explorer/jeeves_lifetime_stats.json`, journals to `~/mentorpi_explorer/journals/`
@@ -507,8 +548,36 @@ No gaps: unknown voice commands (e.g., "find me something to drink") correctly b
 - First `navigate_to()` call may silently queue if Nav2 lifecycle manager hasn't finished configuring (tool returns error, LLM retries — wastes one tool round)
 - Voice instruction cleared immediately after injection — if LLM turn fails, instruction is lost (low risk, same-cycle synchronous injection)
 - Legacy mode (non-agent) ignores free-form voice commands (not relevant for agent demo)
+- YOLO11n ONNX inference takes ~200ms on Pi 5 CPU — runs every sensor snapshot, not parallelized with LLM call yet
+- Map auto-save on timer/shutdown not yet implemented (was `save_map` tool, now removed)
 
-#### Migration Path (6 steps)
+##### Agent Debug Logging (`agent_logger.py`)
+
+`AgentLogger` provides structured, synchronous logging for the agent loop. Each log line is formatted as `[AGENT] HH:MM:SS TAG: detail` and published to both ROS2 rosout and `/semantic_map/agent_status` (for Foxglove).
+
+**9 public methods**: `voice_received`, `turn_start`, `llm_request`, `llm_response`, `tool_start`, `tool_result`, `tool_error`, `turn_complete`, `status`
+
+**Integration points** in `explorer_node.py` (all guarded with `if self._agent_log:`):
+- `_init_agent_mode()`: creates AgentLogger with publish callback
+- `_voice_listener_loop()`: logs voice commands after STT
+- `_agent_loop()`: logs turn_start with voice instruction
+- `_run_agent_turn()`: logs LLM request/response, tool start/result/error, turn_complete
+
+**Per-tool timing stats**: `get_tool_stats()` returns cumulative call count + total time per tool name.
+
+##### Demo Reliability Features (2026-03-11)
+
+Changes to prevent tool call flooding and improve demo reliability:
+
+1. **Movement limiter**: Only 1 movement tool (`navigate_to`, `explore_frontier`, `go_home`, `move_direct`, `look_around`) per LLM response. Additional movement calls return `"Only one movement tool per turn. Wait for next sensor cycle."` — forces LLM to re-evaluate with fresh sensor data.
+
+2. **`explore_frontier` wait**: Now polls `nav2.is_navigating` every 0.5s instead of fire-and-forget. Returns `in_progress` after `NAV2_TOOL_REEVAL_INTERVAL=8s` to let LLM re-evaluate, or `arrived`/error on completion. Handles e-stop cancellation.
+
+3. **Config tuning**: `AGENT_MAX_TOOL_ROUNDS` 5→3, `AGENT_TURN_TIMEOUT` 120s→30s — prevents runaway tool chains.
+
+4. **Agent does NOT auto-start**: `self.exploring = False` on init. Waits for voice command ("start exploring") before beginning autonomous loop.
+
+#### Migration Path (8 steps — ALL DONE)
 
 1. ~~Add `tool_registry.py` + `conversation_manager.py` (new files, no existing changes)~~ **DONE**
 2. ~~Add `agent_turn()` to `LLMProvider` alongside existing `analyze_scene()`~~ **DONE**
@@ -516,6 +585,8 @@ No gaps: unknown voice commands (e.g., "find me something to drink") correctly b
 4. ~~Add `_agent_loop()` alongside `_exploration_loop()` (feature-flagged `agent_mode` param)~~ **DONE**
 5. ~~Switch hybrid launch from RTAbMap to slam_toolbox (create `jeeves_agent.launch.py`)~~ **DONE**
 6. ~~Add Foxglove visualization panels for demo~~ **DONE**
+7. ~~Add YOLO11n local detection + VLM→YOLO cascade + text-only mode for local LLMs~~ **DONE**
+8. ~~Reduce 14→7 tools for hackathon demo, update system prompt, add tool timeout enforcement~~ **DONE**
 
 #### Built-from-Source Packages (Debian Trixie)
 

@@ -24,6 +24,7 @@ Usage:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -64,14 +65,28 @@ class ToolRegistry:
         return list(self._tools.keys())
 
     def execute(self, name: str, params: dict) -> dict:
-        """Execute a tool call, returning the result dict."""
+        """Execute a tool call, returning the result dict.
+
+        Enforces the tool's timeout_s -- if the handler takes longer,
+        returns a timeout error without killing the thread (Python
+        limitation), but the agent loop can continue.
+        """
         tool = self._tools.get(name)
         if not tool:
             return {'success': False, 'error': f'Unknown tool: {name}'}
         if tool.handler is None:
             return {'success': False, 'error': f'Tool {name} has no handler'}
         try:
-            return tool.handler(**params)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(tool.handler, **params)
+                return future.result(timeout=tool.timeout_s)
+        except concurrent.futures.TimeoutError:
+            logger.warning('Tool %s timed out after %.0fs', name, tool.timeout_s)
+            return {
+                'success': False,
+                'error': f'Tool {name} timed out after {tool.timeout_s:.0f}s',
+                'timed_out': True,
+            }
         except TypeError as e:
             return {'success': False, 'error': f'Bad parameters for {name}: {e}'}
         except Exception as e:
@@ -115,11 +130,11 @@ class ToolRegistry:
 
 
 # ======================================================================
-# Tool definitions — JSON schemas for all 14 Jeeves tools
+# Tool definitions — 7 Jeeves demo tools (hackathon set)
 # ======================================================================
 
 def build_jeeves_tools() -> list[ToolDefinition]:
-    """Return the full set of Jeeves tool definitions (no handlers bound).
+    """Return the 7 Jeeves demo tool definitions (no handlers bound).
 
     Handlers are bound later by the agent node via registry.get_tool(name).handler = ...
     """
@@ -188,43 +203,6 @@ def build_jeeves_tools() -> list[ToolDefinition]:
         ),
 
         ToolDefinition(
-            name='move_direct',
-            description=(
-                'Direct motor control for short movements. Use for fine '
-                'positioning, turning to look at something, or when Nav2 '
-                'is overkill. For distances < 0.5m or turns in place.'
-            ),
-            category='navigation',
-            timeout_s=5.0,
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'action': {
-                        'type': 'string',
-                        'enum': [
-                            'forward', 'backward', 'turn_left', 'turn_right',
-                            'spin_left', 'spin_right', 'stop',
-                        ],
-                        'description': 'Movement action.',
-                    },
-                    'speed': {
-                        'type': 'number',
-                        'minimum': 0.0,
-                        'maximum': 1.0,
-                        'description': 'Speed as fraction of max (0.0-1.0).',
-                    },
-                    'duration': {
-                        'type': 'number',
-                        'minimum': 0.5,
-                        'maximum': 3.0,
-                        'description': 'Duration in seconds.',
-                    },
-                },
-                'required': ['action', 'speed', 'duration'],
-            },
-        ),
-
-        ToolDefinition(
             name='go_home',
             description=(
                 'Navigate back to the starting position (map origin 0,0). '
@@ -246,31 +224,12 @@ def build_jeeves_tools() -> list[ToolDefinition]:
 
         # --- Perception ---
         ToolDefinition(
-            name='look_around',
-            description=(
-                'Pan the camera left and right to survey surroundings. '
-                'Returns what was seen in each direction. Use when entering '
-                'a new room, when asked "what do you see", or when uncertain.'
-            ),
-            category='perception',
-            timeout_s=10.0,
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'speech': {
-                        'type': 'string',
-                        'description': 'What to say while looking around.',
-                    },
-                },
-                'required': [],
-            },
-        ),
-
-        ToolDefinition(
             name='identify_objects',
             description=(
-                'Analyze the current camera frame to detect and list visible '
-                'objects with approximate distances and positions. Uses VLM.'
+                'Detect and list objects in the current camera frame with '
+                'distances and positions. Uses VLM (cloud) with YOLO fallback. '
+                'Automatically registers discovered objects in the knowledge '
+                'graph. Also provides a scene description and room type guess.'
             ),
             category='perception',
             timeout_s=15.0,
@@ -283,36 +242,6 @@ def build_jeeves_tools() -> list[ToolDefinition]:
                         'description': 'Which part of the frame to focus on.',
                     },
                 },
-                'required': [],
-            },
-        ),
-
-        ToolDefinition(
-            name='describe_scene',
-            description=(
-                'Get a detailed natural language description of the current '
-                'camera view. Use for room labeling or answering "what do you see".'
-            ),
-            category='perception',
-            timeout_s=15.0,
-            parameters={
-                'type': 'object',
-                'properties': {},
-                'required': [],
-            },
-        ),
-
-        ToolDefinition(
-            name='check_surroundings',
-            description=(
-                'Get a sensor summary without moving. Returns LiDAR distances, '
-                'depth readings, odometry position, and map exploration stats.'
-            ),
-            category='perception',
-            timeout_s=2.0,
-            parameters={
-                'type': 'object',
-                'properties': {},
                 'required': [],
             },
         ),
@@ -353,38 +282,6 @@ def build_jeeves_tools() -> list[ToolDefinition]:
         ),
 
         ToolDefinition(
-            name='register_object',
-            description=(
-                'Register a detected object in the persistent knowledge graph. '
-                'Records its location, category, and which room it is in.'
-            ),
-            category='knowledge',
-            timeout_s=2.0,
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'object_name': {
-                        'type': 'string',
-                        'description': 'Object name (e.g. "refrigerator").',
-                    },
-                    'category': {
-                        'type': 'string',
-                        'description': 'Category (furniture, appliance, decoration, etc.).',
-                    },
-                    'room': {
-                        'type': 'string',
-                        'description': 'Which room it is in (if known).',
-                    },
-                    'description': {
-                        'type': 'string',
-                        'description': 'Brief description of the object.',
-                    },
-                },
-                'required': ['object_name'],
-            },
-        ),
-
-        ToolDefinition(
             name='query_knowledge',
             description=(
                 'Search the knowledge graph for rooms, objects, or spatial '
@@ -413,26 +310,6 @@ def build_jeeves_tools() -> list[ToolDefinition]:
             },
         ),
 
-        ToolDefinition(
-            name='save_map',
-            description=(
-                'Save the current SLAM map to disk for persistence across '
-                'sessions. Use at end of exploration or when asked to remember.'
-            ),
-            category='knowledge',
-            timeout_s=5.0,
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'map_name': {
-                        'type': 'string',
-                        'description': 'Name for the saved map (e.g. "apartment_march2026").',
-                    },
-                },
-                'required': ['map_name'],
-            },
-        ),
-
         # --- Communication ---
         ToolDefinition(
             name='speak',
@@ -457,33 +334,11 @@ def build_jeeves_tools() -> list[ToolDefinition]:
                 'required': ['text'],
             },
         ),
-
-        ToolDefinition(
-            name='listen',
-            description=(
-                'Record audio from the microphone and transcribe it. '
-                'Use when waiting for user instructions.'
-            ),
-            category='communication',
-            timeout_s=15.0,
-            parameters={
-                'type': 'object',
-                'properties': {
-                    'duration_seconds': {
-                        'type': 'integer',
-                        'minimum': 3,
-                        'maximum': 10,
-                        'description': 'Recording duration in seconds.',
-                    },
-                },
-                'required': [],
-            },
-        ),
     ]
 
 
 def create_registry() -> ToolRegistry:
-    """Create a ToolRegistry pre-loaded with all Jeeves tool definitions.
+    """Create a ToolRegistry pre-loaded with 7 Jeeves demo tool definitions.
 
     Handlers are None — the agent node binds them after construction:
         registry = create_registry()

@@ -17,6 +17,7 @@ from autonomous_explorer.tool_registry import create_registry
 
 class MockLogger:
     def info(self, *a, **kw): pass
+    def warn(self, *a, **kw): pass
     def warning(self, *a, **kw): pass
     def error(self, *a, **kw): pass
     def debug(self, *a, **kw): pass
@@ -103,6 +104,13 @@ def mock_node(tmp_dir):
     # Camera
     node._get_camera_frame_b64.return_value = 'fake_b64_image'
     node._get_depth_summary.return_value = 'Depth: center=150cm'
+    node._rgb_lock = MagicMock()
+    node._rgb_image = None
+    node._depth_lock = MagicMock()
+    node._depth_image = None
+
+    # YOLO detector (None = disabled, VLM fallback)
+    node.yolo = None
 
     # Motor control
     node._execute_action.return_value = {
@@ -131,7 +139,7 @@ def handlers(mock_node):
 
 class TestBindToRegistry:
 
-    def test_binds_all_14_handlers(self, mock_node):
+    def test_binds_all_7_handlers(self, mock_node):
         reg = create_registry()
         h = ToolHandlers(mock_node)
         h.bind_to_registry(reg)
@@ -143,7 +151,7 @@ class TestBindToRegistry:
         reg = create_registry()
         h = ToolHandlers(mock_node)
         h.bind_to_registry(reg)
-        result = reg.execute('check_surroundings', {})
+        result = reg.execute('speak', {'text': 'hello'})
         assert result['success'] is True
 
 
@@ -182,6 +190,100 @@ class TestExploreFrontier:
         result = handlers.explore_frontier()
         assert result['success'] is True
         assert result['status'] == 'no_frontiers'
+
+    def test_goal_not_accepted(self, handlers, mock_node):
+        mock_node.use_nav2 = True
+        mock_node.nav2 = MagicMock()
+        mock_node.nav2.has_map = True
+        mock_node.nav2.get_frontier_goals.return_value = [
+            {'x': 1.0, 'y': 2.0, 'size': 10, 'distance': 1.5},
+        ]
+        mock_node.nav2.navigate_to.return_value = False
+        result = handlers.explore_frontier()
+        assert result['success'] is False
+        assert 'not accepted' in result['error']
+
+    def test_navigation_succeeds(self, handlers, mock_node):
+        mock_node.use_nav2 = True
+        mock_node.nav2 = MagicMock()
+        mock_node.nav2.has_map = True
+        mock_node.nav2.get_frontier_goals.return_value = [
+            {'x': 1.0, 'y': 2.0, 'size': 10, 'distance': 1.5},
+        ]
+        mock_node.nav2.navigate_to.return_value = True
+        # Navigation completes immediately
+        mock_node.nav2.is_navigating = False
+        mock_node.nav2.navigation_result = 'succeeded'
+        result = handlers.explore_frontier()
+        assert result['success'] is True
+        assert result['status'] == 'arrived'
+        assert result['goal']['x'] == 1.0
+
+    def test_navigation_fails(self, handlers, mock_node):
+        mock_node.use_nav2 = True
+        mock_node.nav2 = MagicMock()
+        mock_node.nav2.has_map = True
+        mock_node.nav2.get_frontier_goals.return_value = [
+            {'x': 1.0, 'y': 2.0, 'size': 10, 'distance': 1.5},
+        ]
+        mock_node.nav2.navigate_to.return_value = True
+        mock_node.nav2.is_navigating = False
+        mock_node.nav2.navigation_result = 'failed'
+        result = handlers.explore_frontier()
+        assert result['success'] is False
+        assert result['status'] == 'failed'
+
+    def test_emergency_stop_cancels(self, handlers, mock_node):
+        mock_node.use_nav2 = True
+        mock_node.nav2 = MagicMock()
+        mock_node.nav2.has_map = True
+        mock_node.nav2.get_frontier_goals.return_value = [
+            {'x': 1.0, 'y': 2.0, 'size': 10, 'distance': 1.5},
+        ]
+        mock_node.nav2.navigate_to.return_value = True
+        mock_node.nav2.is_navigating = True
+        mock_node.emergency_stop = True
+        result = handlers.explore_frontier()
+        assert result['success'] is False
+        assert 'Emergency stop' in result['error']
+        mock_node.nav2.cancel_navigation.assert_called_once()
+
+    @patch('autonomous_explorer.tool_handlers.NAV2_TOOL_REEVAL_INTERVAL', 0.1)
+    @patch('autonomous_explorer.tool_handlers.time.sleep', return_value=None)
+    def test_returns_in_progress_at_reeval_interval(self, _sleep, handlers, mock_node):
+        mock_node.use_nav2 = True
+        mock_node.nav2 = MagicMock()
+        mock_node.nav2.has_map = True
+        mock_node.nav2.get_frontier_goals.return_value = [
+            {'x': 1.0, 'y': 2.0, 'size': 10, 'distance': 1.5},
+            {'x': 3.0, 'y': 4.0, 'size': 5, 'distance': 3.0},
+        ]
+        mock_node.nav2.navigate_to.return_value = True
+        mock_node.nav2.is_navigating = True
+        mock_node.nav2.navigation_feedback = {'distance_remaining': 1.2}
+        import time
+        # After the reeval interval elapses, should return in_progress
+        result = handlers.explore_frontier()
+        assert result['success'] is True
+        assert result['status'] == 'in_progress'
+        assert result['alternatives'] == 1
+        assert result['distance_remaining'] == 1.2
+
+    def test_largest_preference(self, handlers, mock_node):
+        mock_node.use_nav2 = True
+        mock_node.nav2 = MagicMock()
+        mock_node.nav2.has_map = True
+        mock_node.nav2.get_frontier_goals.return_value = [
+            {'x': 1.0, 'y': 2.0, 'size': 5, 'distance': 1.0},
+            {'x': 3.0, 'y': 4.0, 'size': 20, 'distance': 3.0},
+        ]
+        mock_node.nav2.navigate_to.return_value = True
+        mock_node.nav2.is_navigating = False
+        mock_node.nav2.navigation_result = 'succeeded'
+        result = handlers.explore_frontier(preference='largest')
+        assert result['success'] is True
+        # Should have navigated to the largest frontier (size=20)
+        mock_node.nav2.navigate_to.assert_called_once_with(3.0, 4.0)
 
 
 class TestMoveDirect:
@@ -431,14 +533,6 @@ class TestListen:
 class TestEndToEnd:
     """Test full registry → handler → execute pipeline."""
 
-    def test_execute_check_surroundings(self, mock_node):
-        reg = create_registry()
-        h = ToolHandlers(mock_node)
-        h.bind_to_registry(reg)
-        result = reg.execute('check_surroundings', {})
-        assert result['success'] is True
-        assert 'lidar' in result
-
     def test_execute_speak(self, mock_node):
         reg = create_registry()
         h = ToolHandlers(mock_node)
@@ -446,15 +540,15 @@ class TestEndToEnd:
         result = reg.execute('speak', {'text': 'Testing', 'wait': True})
         assert result['success'] is True
 
-    def test_execute_move_direct(self, mock_node):
+    def test_unregistered_tool_returns_error(self, mock_node):
         reg = create_registry()
         h = ToolHandlers(mock_node)
         h.bind_to_registry(reg)
         result = reg.execute('move_direct', {
             'action': 'forward', 'speed': 0.5, 'duration': 1.0,
         })
-        assert result['success'] is True
-        mock_node._execute_action.assert_called_once()
+        assert result['success'] is False
+        assert result['error'] is not None
 
     def test_execute_label_room(self, mock_node):
         reg = create_registry()
@@ -465,3 +559,71 @@ class TestEndToEnd:
         })
         assert result['success'] is True
         assert result['room'] == 'lab'
+
+
+# ===================================================================
+# Tool timeout enforcement
+# ===================================================================
+
+class TestToolTimeout:
+    """Verify that ToolRegistry.execute() enforces per-tool timeout_s."""
+
+    def test_fast_handler_returns_normally(self):
+        """A handler that completes within timeout_s returns its result."""
+        from autonomous_explorer.tool_registry import ToolDefinition, ToolRegistry
+
+        def fast_handler():
+            return {'success': True, 'value': 42}
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name='fast_tool',
+            description='Completes quickly.',
+            parameters={'type': 'object', 'properties': {}},
+            handler=fast_handler,
+            timeout_s=5.0,
+        ))
+        result = reg.execute('fast_tool', {})
+        assert result == {'success': True, 'value': 42}
+
+    def test_slow_handler_returns_timeout_error(self):
+        """A handler that exceeds timeout_s returns a timeout error dict."""
+        import time as _time
+        from autonomous_explorer.tool_registry import ToolDefinition, ToolRegistry
+
+        def slow_handler():
+            _time.sleep(2)
+            return {'success': True}
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name='slow_tool',
+            description='Takes too long.',
+            parameters={'type': 'object', 'properties': {}},
+            handler=slow_handler,
+            timeout_s=0.5,
+        ))
+        result = reg.execute('slow_tool', {})
+        assert result['success'] is False
+        assert result['timed_out'] is True
+        assert 'timed out' in result['error']
+
+    def test_exception_handler_returns_error(self):
+        """A handler that raises an exception returns an error dict."""
+        from autonomous_explorer.tool_registry import ToolDefinition, ToolRegistry
+
+        def bad_handler():
+            raise RuntimeError('sensor exploded')
+
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name='bad_tool',
+            description='Always fails.',
+            parameters={'type': 'object', 'properties': {}},
+            handler=bad_handler,
+            timeout_s=5.0,
+        ))
+        result = reg.execute('bad_tool', {})
+        assert result['success'] is False
+        assert 'sensor exploded' in result['error']
+        assert 'timed_out' not in result

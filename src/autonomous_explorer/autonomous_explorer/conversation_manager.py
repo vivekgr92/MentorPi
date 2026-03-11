@@ -246,7 +246,7 @@ class ConversationManager:
             role = msg['role']
 
             if role == 'user':
-                rendered.append(msg)
+                rendered.append(self._convert_user_msg_openai(msg))
 
             elif role == 'assistant':
                 if '_tool_calls' in msg:
@@ -286,6 +286,32 @@ class ConversationManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _convert_user_msg_openai(msg: dict) -> dict:
+        """Convert a user message from Claude image format to OpenAI format.
+
+        Claude uses {'type': 'image', 'source': {'data': ..., 'media_type': ...}}
+        OpenAI uses {'type': 'image_url', 'image_url': {'url': 'data:...;base64,...'}}
+        """
+        content = msg.get('content')
+        if not isinstance(content, list):
+            return msg  # plain text, no conversion needed
+        converted = []
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'image':
+                src = block.get('source', {})
+                b64 = src.get('data', '')
+                media = src.get('media_type', 'image/jpeg')
+                converted.append({
+                    'type': 'image_url',
+                    'image_url': {'url': f'data:{media};base64,{b64}'},
+                })
+            elif isinstance(block, dict) and block.get('type') == 'tool_result':
+                continue  # OpenAI uses separate tool role messages
+            else:
+                converted.append(block)
+        return {'role': 'user', 'content': converted} if converted else msg
 
     def _trim_window(self) -> None:
         """Remove old turns to keep within max_turns."""

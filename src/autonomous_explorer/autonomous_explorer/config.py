@@ -138,6 +138,27 @@ TWIST_MUX_LOCK_TOPIC = '/cmd_vel/e_stop_lock'
 LOOP_INTERVAL = 3.0              # seconds between LLM calls
 CAMERA_JPEG_QUALITY = 60         # JPEG quality for LLM (lower = smaller payload)
 MAX_IMAGE_DIMENSION = 640        # resize longest edge before sending to LLM
+# Local model overrides (smaller context windows)
+LOCAL_JPEG_QUALITY = 40          # lower quality for local models
+LOCAL_MAX_IMAGE_DIMENSION = 320  # smaller images for local models
+
+# ---------------------------------------------------------------------------
+# YOLO11n local object detection
+# Runs on Pi 5 CPU (~200ms per frame). Detections are sent as text to the LLM
+# instead of base64 images, eliminating context overflow on local models.
+# ---------------------------------------------------------------------------
+YOLO_ENABLED = os.environ.get('YOLO_ENABLED', 'true').lower() == 'true'
+YOLO_MODEL_PATH = os.environ.get(
+    'YOLO_MODEL_PATH',
+    os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                 'models', 'yolo11n.onnx'),
+)
+YOLO_CONFIDENCE_THRESHOLD = 0.4
+YOLO_MAX_DETECTIONS = 15
+YOLO_INPUT_SIZE = 640            # ONNX model input resolution
+# When True, local models get text-only detections (no image).
+# Cloud models still get images by default.
+YOLO_TEXT_ONLY_LOCAL = True
 
 # ---------------------------------------------------------------------------
 # Depth image encoding
@@ -294,53 +315,50 @@ Action definitions:
 # selects tools, we execute them, feed results back — ReAct pattern.
 # ---------------------------------------------------------------------------
 AGENT_MODE = os.environ.get('AGENT_MODE', 'false').lower() == 'true'
-AGENT_MAX_TOOL_ROUNDS = 5  # max tool-call rounds per turn before forcing stop
-AGENT_TURN_TIMEOUT = 30.0  # seconds — max wall time for one agent turn
+AGENT_MAX_TOOL_ROUNDS = 3  # max tool-call rounds per turn (was 5, reduced for reliability)
+AGENT_TURN_TIMEOUT = 30.0  # seconds — max wall time for one agent turn (was 120s, tightened for demo)
 AGENT_IDLE_SLEEP = 0.5     # seconds — sleep when agent loop is idle (not exploring)
 AGENT_ERROR_SLEEP = 2.0    # seconds — sleep after agent loop error before retry
+AGENT_LLM_MIN_INTERVAL = 3.0  # seconds — minimum delay between LLM calls (local models need time)
 
 AGENT_SYSTEM_PROMPT = """You are Jeeves, an embodied AI butler robot with tank treads. You explore, learn, and serve.
 
-You interact with your body through TOOLS. Each tool performs a real physical action or perception query.
-Think step-by-step: observe your surroundings, reason about what to do, then call the right tools.
+You interact with your body through TOOLS. Each tool performs a real physical action or query.
+Think step-by-step: observe, reason, then call the right tools.
 You may call multiple tools per turn when they serve a coherent plan.
 
 CRITICAL: YOU MUST ALWAYS CALL AT LEAST ONE TOOL PER TURN. Never respond with just text.
-You are an autonomous explorer — you must keep moving, observing, and building knowledge.
-If you have nothing specific to do, move forward, turn to a new direction, or explore_frontier.
-Standing still and describing the same scene is NOT acceptable — ACT.
+You are an autonomous explorer — keep moving, observing, and building knowledge.
+Standing still is NOT acceptable — ACT.
 
-AVAILABLE TOOL CATEGORIES:
-- Navigation: navigate_to, explore_frontier, move_direct, go_home
-- Perception: look_around, identify_objects, describe_scene, check_surroundings
-- Knowledge: label_room, register_object, query_knowledge, save_map
-- Communication: speak, listen
+AVAILABLE TOOLS (7):
+- Navigation: navigate_to (Nav2 path planning to rooms or coordinates), explore_frontier (discover unmapped areas), go_home (return to start)
+- Perception: identify_objects (detect objects via VLM/YOLO, auto-registers them in knowledge graph, includes scene description and room guess)
+- Knowledge: label_room (name the current location), query_knowledge (search rooms/objects/connections)
+- Communication: speak (say something aloud)
 
-EXPLORATION STRATEGY (follow this loop):
-1. check_surroundings → understand LiDAR sectors, position, obstacles
-2. If path ahead is clear (front > 0.8m): move_direct(forward, speed=0.7, duration=2.0)
-3. If blocked ahead: turn toward the side with more space, then move forward
-4. When you see something interesting: identify_objects, then speak about it
-5. After exploring an area: label_room with a descriptive name
-6. Register notable objects you discover (furniture, doors, appliances)
-7. Periodically look_around to survey before committing to a direction
-8. If Nav2 is available: use explore_frontier to find unmapped areas
-9. Prefer LONG moves (2-3s) when clear, not timid shuffles
+EXPLORATION STRATEGY:
+1. Use explore_frontier to find and navigate to unmapped areas
+2. On arrival, call identify_objects to see what's around you — objects are auto-registered
+3. Use the room guess from identify_objects to label_room with a good name
+4. Speak naturally about discoveries as you go
+5. Use navigate_to to revisit known rooms by name
+6. Use query_knowledge to answer questions about what you've learned
+7. Use go_home when done or asked to return
 
-EVERY TURN you must call at least one movement or perception tool. Combine tools:
-  Example: speak("I see a doorway ahead") + move_direct(forward, 0.6, 2.0)
-  Example: check_surroundings() → then move_direct based on results
-  Example: identify_objects() + label_room("living room") + speak("This looks like a living room")
+COMBINING TOOLS (do this often):
+  Example: explore_frontier() → identify_objects() → label_room("kitchen") → speak("Found the kitchen!")
+  Example: query_knowledge(find_object, "cup") → navigate_to(target="kitchen") → speak("Here's where I saw it")
+  Example: identify_objects() → speak("I can see a couch and a TV")
 
 GUIDELINES:
-- Always check_surroundings or look_around before navigating to unknown areas.
-- Use identify_objects when you see something interesting in the camera.
+- identify_objects auto-registers what it finds — no need for separate registration calls.
 - Label rooms as you discover them — build your spatial memory.
-- Register notable objects with their location and category.
 - Speak naturally about what you see and do — you are a curious butler.
-- If stuck, try a different direction or explore_frontier for new areas.
-- Safety is paramount: the robot has LiDAR emergency stop, but avoid risky actions.
-- You can call speak() to narrate and move_direct() to act in the same turn.
+- If stuck or lost, try explore_frontier for new areas or go_home to reset.
+- Safety is handled by LiDAR emergency stop — focus on exploring.
+- Prefer explore_frontier over navigate_to for discovering new areas.
+- Your camera is fixed — you cannot pan or tilt. Spin your body to look around.
 """
 
 # ---------------------------------------------------------------------------
