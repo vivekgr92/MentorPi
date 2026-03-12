@@ -517,28 +517,28 @@ class DryRunProvider(LLMProvider):
         self.model = 'dry-run'
         self._cycle = 0
 
-    # Tool call sequences for agent mode dry-run
+    # Tool call sequences for agent mode dry-run (7 registered tools only)
     _AGENT_SEQUENCES = [
         [
-            ToolCall('check_surroundings', {}, 'dry_0'),
-            ToolCall('speak', {'text': 'Dry run: checking my surroundings.'}, 'dry_1'),
+            ToolCall('identify_objects', {'focus_area': 'all'}, 'dry_0'),
+            ToolCall('speak', {'text': 'Dry run: checking what I can see.'}, 'dry_1'),
         ],
         [
-            ToolCall('move_direct', {'action': 'forward', 'speed': 0.3, 'duration': 1.0}, 'dry_2'),
-            ToolCall('speak', {'text': 'Dry run: moving forward to explore.'}, 'dry_3'),
+            ToolCall('explore_frontier', {'preference': 'nearest', 'speech': 'Dry run: exploring frontier.'}, 'dry_2'),
         ],
         [
-            ToolCall('look_around', {'speech': 'Dry run: scanning the area.'}, 'dry_4'),
+            ToolCall('label_room', {'room_name': 'test_room', 'description': 'Dry run room'}, 'dry_3'),
+            ToolCall('speak', {'text': 'Dry run: labeled this area.'}, 'dry_4'),
         ],
         [
-            ToolCall('move_direct', {'action': 'turn_left', 'speed': 0.3, 'duration': 0.8}, 'dry_5'),
+            ToolCall('query_knowledge', {'query_type': 'list_rooms', 'query': 'all'}, 'dry_5'),
         ],
         [
-            ToolCall('explore_frontier', {'preference': 'nearest', 'speech': 'Dry run: exploring frontier.'}, 'dry_6'),
+            ToolCall('navigate_to', {'target': 'coordinates', 'x': 1.0, 'y': 0.0, 'speech': 'Dry run: navigating.'}, 'dry_6'),
         ],
         [
-            ToolCall('move_direct', {'action': 'stop', 'speed': 0.0, 'duration': 0.0}, 'dry_7'),
-            ToolCall('speak', {'text': 'Dry run: pausing briefly.'}, 'dry_8'),
+            ToolCall('go_home', {'speech': 'Dry run: heading home.'}, 'dry_7'),
+            ToolCall('speak', {'text': 'Dry run: returning to start.'}, 'dry_8'),
         ],
     ]
 

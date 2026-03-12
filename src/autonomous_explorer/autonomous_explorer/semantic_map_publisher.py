@@ -2,34 +2,29 @@
 """
 Semantic Map Publisher Node.
 
-Reads from WorldKnowledge JSON files on disk and publishes ROS2 MarkerArray
-messages for Foxglove visualization. Judges see room labels appearing on the
-map in real-time as Jeeves explores and labels new rooms.
+Reads from the WorldKnowledge NetworkX knowledge graph on disk and publishes
+ROS2 MarkerArray messages for Foxglove visualization. Judges see room labels
+appearing on the map in real-time as Jeeves explores and labels new rooms.
 
 Published topics:
   /semantic_map/rooms    — visualization_msgs/MarkerArray (TEXT_VIEW_FACING)
   /semantic_map/objects  — visualization_msgs/MarkerArray (TEXT_VIEW_FACING)
-  /semantic_map/agent_status — std_msgs/String (current LLM reasoning)
+
+Note: /semantic_map/agent_status is published by explorer_node directly (not here).
 
 Persistence:
-  ~/.jeeves/semantic_map.json — simplified view for external tools
+  ~/.jeeves/knowledge_graph.json — NetworkX node_link_data graph
 """
 import json
 import os
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
-from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
-# Where WorldKnowledge stores its files
-_DEFAULT_KNOWLEDGE_DIR = os.path.expanduser('~/mentorpi_explorer/knowledge')
-# Where we write the simplified semantic_map.json
-_DEFAULT_SEMANTIC_MAP_PATH = os.path.expanduser('~/.jeeves/semantic_map.json')
+from autonomous_explorer.world_knowledge import _DEFAULT_GRAPH_PATH
 
 
 class SemanticMapPublisher(Node):
@@ -38,33 +33,18 @@ class SemanticMapPublisher(Node):
         super().__init__('semantic_map_publisher')
 
         # Parameters
-        self.declare_parameter(
-            'knowledge_dir', _DEFAULT_KNOWLEDGE_DIR)
-        self.declare_parameter(
-            'semantic_map_path', _DEFAULT_SEMANTIC_MAP_PATH)
+        self.declare_parameter('graph_path', _DEFAULT_GRAPH_PATH)
         self.declare_parameter('publish_rate', 1.0)
 
-        self._knowledge_dir = self.get_parameter(
-            'knowledge_dir').get_parameter_value().string_value
-        self._semantic_map_path = self.get_parameter(
-            'semantic_map_path').get_parameter_value().string_value
+        self._graph_path = self.get_parameter(
+            'graph_path').get_parameter_value().string_value
         self._publish_rate = self.get_parameter(
             'publish_rate').get_parameter_value().double_value
 
-        # Ensure output directories exist
-        Path(self._semantic_map_path).parent.mkdir(parents=True, exist_ok=True)
-
-        # File paths for WorldKnowledge data
-        self._world_map_file = os.path.join(
-            self._knowledge_dir, 'world_map.json')
-        self._known_objects_file = os.path.join(
-            self._knowledge_dir, 'known_objects.json')
-
         # Cache: avoid re-publishing if nothing changed
-        self._last_world_map_mtime = 0.0
-        self._last_objects_mtime = 0.0
-        self._rooms_data = {}
-        self._objects_data = {}
+        self._last_mtime = 0.0
+        self._rooms = {}   # {name: {x, y, times_visited, description, ...}}
+        self._objects = {}  # {name: {room, confidence, ...}}
 
         # Transient latched QoS so Foxglove sees markers immediately on connect
         latched_qos = QoSProfile(
@@ -78,16 +58,13 @@ class SemanticMapPublisher(Node):
             MarkerArray, '/semantic_map/rooms', latched_qos)
         self._objects_pub = self.create_publisher(
             MarkerArray, '/semantic_map/objects', latched_qos)
-        self._status_pub = self.create_publisher(
-            String, '/semantic_map/agent_status', 10)
+        # NOTE: /semantic_map/agent_status is published directly by
+        # explorer_node via AgentLogger (TRANSIENT_LOCAL QoS).
+        # Do NOT create a second publisher here — dual publishers with
+        # different QoS on the same topic confuses Foxglove's subscriber.
 
-        # Subscribe to explorer status for agent reasoning
-        self._latest_reasoning = ''
-        self.create_subscription(
-            String, '/explorer/status', self._status_cb, 10)
-
-        # Load persisted semantic map on startup
-        self._load_semantic_map()
+        # Load on startup
+        self._reload_graph()
 
         # 1Hz timer
         period = 1.0 / self._publish_rate
@@ -95,82 +72,99 @@ class SemanticMapPublisher(Node):
 
         self.get_logger().info(
             f'Semantic map publisher started '
-            f'(knowledge_dir={self._knowledge_dir}, '
+            f'(graph_path={self._graph_path}, '
             f'rate={self._publish_rate}Hz)')
-
-    # ── Subscriber callback ──
-
-    def _status_cb(self, msg: String):
-        """Extract LLM reasoning from explorer status JSON."""
-        try:
-            status = json.loads(msg.data)
-            reasoning = status.get('llm', {}).get('reasoning', '')
-            if not reasoning:
-                reasoning = status.get('llm', {}).get('action', '')
-            if reasoning and reasoning != self._latest_reasoning:
-                self._latest_reasoning = reasoning
-                out = String()
-                out.data = reasoning
-                self._status_pub.publish(out)
-        except (json.JSONDecodeError, AttributeError):
-            pass
 
     # ── Timer callback ──
 
     def _timer_cb(self):
-        """Read knowledge files, publish markers, save semantic map."""
-        changed = self._reload_knowledge_files()
-        # Always publish (markers are latched, but new subscriptions need them)
+        """Read knowledge graph, publish markers."""
+        self._reload_graph()
         self._publish_room_markers()
         self._publish_object_markers()
-        if changed:
-            self._save_semantic_map()
 
-    # ── Knowledge file reading ──
+    # ── Knowledge graph reading ──
 
-    def _reload_knowledge_files(self) -> bool:
-        """Re-read WorldKnowledge JSON files if modified. Returns True if changed."""
-        changed = False
-
-        # world_map.json
+    def _reload_graph(self) -> bool:
+        """Re-read knowledge graph JSON if modified. Returns True if changed."""
         try:
-            mtime = os.path.getmtime(self._world_map_file)
-            if mtime != self._last_world_map_mtime:
-                with open(self._world_map_file, 'r') as f:
-                    self._rooms_data = json.load(f)
-                self._last_world_map_mtime = mtime
-                changed = True
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+            mtime = os.path.getmtime(self._graph_path)
+            if mtime == self._last_mtime:
+                return False
+        except FileNotFoundError:
+            return False
 
-        # known_objects.json
         try:
-            mtime = os.path.getmtime(self._known_objects_file)
-            if mtime != self._last_objects_mtime:
-                with open(self._known_objects_file, 'r') as f:
-                    self._objects_data = json.load(f)
-                self._last_objects_mtime = mtime
-                changed = True
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+            with open(self._graph_path, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False
 
-        return changed
+        self._last_mtime = mtime
+
+        # Parse node_link_data format: nodes have 'id' and attributes
+        rooms = {}
+        objects = {}
+        nodes_by_id = {}
+
+        for node in data.get('nodes', []):
+            node_id = node.get('id', '')
+            node_type = node.get('type', '')
+            nodes_by_id[node_id] = node
+
+            if node_type == 'room':
+                rooms[node_id] = {
+                    'x': float(node.get('x', 0.0)),
+                    'y': float(node.get('y', 0.0)),
+                    'times_visited': node.get('times_visited', 1),
+                    'description': node.get('description', ''),
+                    'first_discovered': node.get('first_discovered', ''),
+                }
+            elif node_type == 'object':
+                obj_name = node.get('name', node_id.removeprefix('obj:'))
+                objects[obj_name] = {
+                    'confidence': node.get('confidence', 0.0),
+                    'last_seen': node.get('last_seen', ''),
+                    'node_id': node_id,
+                }
+
+        # Find room for each object via CONTAINS edges
+        for link in data.get('links', []):
+            source = link.get('source', '')
+            target = link.get('target', '')
+            relation = link.get('relation', '')
+            if relation == 'CONTAINS':
+                # source=room, target=obj:name
+                src_node = nodes_by_id.get(source, {})
+                tgt_node = nodes_by_id.get(target, {})
+                if src_node.get('type') == 'room':
+                    obj_name = tgt_node.get(
+                        'name', target.removeprefix('obj:'))
+                    if obj_name in objects:
+                        objects[obj_name]['room'] = source
+                        # Use room coords for object position
+                        objects[obj_name]['x'] = float(
+                            src_node.get('x', 0.0))
+                        objects[obj_name]['y'] = float(
+                            src_node.get('y', 0.0))
+
+        self._rooms = rooms
+        self._objects = objects
+        return True
 
     # ── MarkerArray publishing ──
 
     def _publish_room_markers(self):
         """Publish TEXT_VIEW_FACING markers for each labeled room."""
-        rooms = self._rooms_data.get('rooms', {})
-        if not rooms:
+        if not self._rooms:
             return
 
         marker_array = MarkerArray()
         now = self.get_clock().now().to_msg()
 
-        for idx, (name, info) in enumerate(rooms.items()):
-            # Rooms need coordinates — use position if stored
-            x = float(info.get('x', info.get('position', {}).get('x', 0.0)))
-            y = float(info.get('y', info.get('position', {}).get('y', 0.0)))
+        for idx, (name, info) in enumerate(self._rooms.items()):
+            x = info.get('x', 0.0)
+            y = info.get('y', 0.0)
 
             marker = Marker()
             marker.header.frame_id = 'map'
@@ -195,7 +189,7 @@ class SemanticMapPublisher(Node):
             marker.color.a = 1.0
 
             # Plain text — no emoji (Foxglove font may not render them)
-            visits = info.get('times_visited', info.get('visit_count', 1))
+            visits = info.get('times_visited', 1)
             label = name.title()
             if isinstance(visits, int) and visits > 1:
                 label += f' ({visits}x)'
@@ -208,38 +202,20 @@ class SemanticMapPublisher(Node):
 
     def _publish_object_markers(self):
         """Publish TEXT_VIEW_FACING markers for each registered object."""
-        objects = self._objects_data.get('objects', self._objects_data)
-        if not objects or not isinstance(objects, dict):
+        if not self._objects:
             return
 
         marker_array = MarkerArray()
         now = self.get_clock().now().to_msg()
 
         idx = 0
-        for name, info in objects.items():
-            if not isinstance(info, dict):
+        for name, info in self._objects.items():
+            # Only show objects that have a position (via room)
+            if 'x' not in info or 'y' not in info:
                 continue
 
-            # Objects may have direct x/y or locations list
-            locations = info.get('locations', [])
-            if locations and isinstance(locations, list):
-                loc = locations[-1]  # Most recent location
-                if isinstance(loc, dict):
-                    x = float(loc.get('x', 0.0))
-                    y = float(loc.get('y', 0.0))
-                elif isinstance(loc, (list, tuple)) and len(loc) >= 2:
-                    x, y = float(loc[0]), float(loc[1])
-                else:
-                    continue
-            elif 'x' in info and 'y' in info:
-                x = float(info['x'])
-                y = float(info['y'])
-            elif 'position' in info:
-                x = float(info['position'].get('x', 0.0))
-                y = float(info['position'].get('y', 0.0))
-            else:
-                # No position data — skip
-                continue
+            x = info['x']
+            y = info['y']
 
             marker = Marker()
             marker.header.frame_id = 'map'
@@ -264,10 +240,10 @@ class SemanticMapPublisher(Node):
             marker.color.a = 1.0
 
             # Plain text — no emoji
-            category = info.get('category', '')
+            room = info.get('room', '')
             label = name
-            if category:
-                label += f' [{category}]'
+            if room:
+                label += f' [{room}]'
             marker.text = label
             marker.lifetime.sec = 0
 
@@ -275,61 +251,6 @@ class SemanticMapPublisher(Node):
             idx += 1
 
         self._objects_pub.publish(marker_array)
-
-    # ── Semantic map persistence ──
-
-    def _load_semantic_map(self):
-        """Load previously saved semantic_map.json to bootstrap rooms/objects."""
-        try:
-            with open(self._semantic_map_path, 'r') as f:
-                data = json.load(f)
-            self.get_logger().info(
-                f'Loaded semantic map: {len(data.get("rooms", []))} rooms')
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.get_logger().info('No previous semantic map found, starting fresh')
-
-    def _save_semantic_map(self):
-        """Save simplified semantic map JSON for external consumption."""
-        rooms_list = []
-        rooms = self._rooms_data.get('rooms', {})
-        objects = self._objects_data.get('objects', self._objects_data)
-
-        for name, info in rooms.items():
-            x = float(info.get('x', info.get('position', {}).get('x', 0.0)))
-            y = float(info.get('y', info.get('position', {}).get('y', 0.0)))
-
-            # Collect objects associated with this room
-            room_objects = []
-            if isinstance(objects, dict):
-                for obj_name, obj_info in objects.items():
-                    if isinstance(obj_info, dict):
-                        obj_room = obj_info.get('room', '')
-                        if obj_room and obj_room.lower() == name.lower():
-                            room_objects.append(obj_name)
-
-            labeled_at = info.get('discovered', info.get('labeled_at', ''))
-            if not labeled_at:
-                labeled_at = datetime.now(timezone.utc).isoformat()
-
-            rooms_list.append({
-                'name': name,
-                'x': x,
-                'y': y,
-                'objects': room_objects,
-                'labeled_at': labeled_at,
-            })
-
-        semantic_map = {
-            'rooms': rooms_list,
-            'home_position': {'x': 0.0, 'y': 0.0},
-            'last_updated': datetime.now(timezone.utc).isoformat(),
-        }
-
-        try:
-            with open(self._semantic_map_path, 'w') as f:
-                json.dump(semantic_map, f, indent=2)
-        except OSError as e:
-            self.get_logger().warning(f'Failed to save semantic map: {e}')
 
 
 def main(args=None):

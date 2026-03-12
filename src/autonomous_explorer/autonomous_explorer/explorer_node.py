@@ -25,12 +25,14 @@ import json
 import math
 import os
 import queue
+import re
 import signal
 import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -54,6 +56,7 @@ from autonomous_explorer.config import (
     AGENT_MODE,
     AGENT_SYSTEM_PROMPT,
     AGENT_TURN_TIMEOUT,
+    SEARCH_VLM_DISTANCE_M,
     ANGULAR_ACCEL,
     ANGULAR_DECEL,
     ANTHROPIC_API_KEY,
@@ -215,6 +218,7 @@ class AutonomousExplorer(Node):
 
     def __init__(self):
         super().__init__('autonomous_explorer')
+        self._setup_file_logging()
         self.get_logger().info('Initializing Autonomous Explorer...')
 
         self._declare_and_read_parameters()
@@ -244,6 +248,47 @@ class AutonomousExplorer(Node):
     # ------------------------------------------------------------------
     # Initialization helpers (called only from __init__)
     # ------------------------------------------------------------------
+
+    def _setup_file_logging(self):
+        """Subscribe to /rosout to capture all logger output to a file.
+
+        rclpy's get_logger() uses C-level rcutils which can't be safely
+        monkey-patched (causes 'Logger severity cannot be changed between
+        calls' errors). Instead, we subscribe to /rosout — every
+        get_logger() call publishes there — and write matching messages
+        to a file.
+        """
+        from rcl_interfaces.msg import Log
+
+        log_dir = os.path.expanduser(
+            os.environ.get('EXPLORER_LOG_DIR', '~/mentorpi_explorer/logs'))
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.environ.get(
+            'EXPLORER_LOG_FILE',
+            os.path.join(
+                log_dir,
+                f'explorer_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'))
+
+        self._log_file_handle = open(log_file, 'a', buffering=1)  # line-buffered
+        self._log_file_path = log_file
+
+        _SEVERITY = {10: 'DEBUG', 20: 'INFO', 30: 'WARN', 40: 'ERROR', 50: 'FATAL'}
+        node_name = self.get_name()
+        fh = self._log_file_handle
+
+        def _rosout_cb(msg: Log):
+            # Only capture logs from our node
+            if msg.name != node_name:
+                return
+            try:
+                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                level = _SEVERITY.get(msg.level, 'INFO')
+                fh.write(f'{ts} [{level}] {msg.msg}\n')
+            except Exception:
+                pass
+
+        self.create_subscription(Log, '/rosout', _rosout_cb, 50)
+        print(f'[Explorer] Logging to: {log_file}')
 
     def _declare_and_read_parameters(self):
         """Declare ROS2 parameters and read their values."""
@@ -363,6 +408,16 @@ class AutonomousExplorer(Node):
         self._voice_queue: queue.Queue = queue.Queue(maxsize=5)
         # Pending voice instruction for agent mode (injected into next LLM turn)
         self._pending_voice_instruction: str | None = None
+        # Set by voice listener to interrupt current agent turn
+        self._voice_interrupt: bool = False
+
+        # Active search state — persists across agent turns
+        self._search_target: str | None = None  # e.g. "trash can"
+        self._search_start_cycle: int = 0       # cycle when search began
+        self._searched_rooms: list[str] = []     # rooms checked during this search
+        self._vlm_scan_odom: tuple[float, float] | None = None  # (x,y) at last VLM scan
+        self._last_vlm_scan_results: list = []   # cached VLM object list
+        self._search_knowledge_result: dict | None = None  # Rule 1: pre-queried knowledge
 
     def _init_joystick(self):
         """Initialize joystick reader and manual control state."""
@@ -892,6 +947,8 @@ class AutonomousExplorer(Node):
                 self.get_logger().info('Cannot start in manual mode')
             else:
                 self.exploring = True
+                if self.use_nav2 and self.nav2:
+                    self.nav2.clear_visited_frontiers()
                 self.get_logger().info('Exploration started (topic command)')
         elif cmd in ('stop', 's'):
             self.exploring = False
@@ -963,6 +1020,52 @@ class AutonomousExplorer(Node):
             self._estop_lock_pub.publish(lock_msg)
         self._last_command_time = time.time()
         self._last_twist = (0.0, 0.0)
+
+    def _escape_obstacle(self):
+        """Actively back away from obstacle instead of just waiting.
+
+        Checks LiDAR sectors to decide escape direction:
+        - If back is clear, reverse straight
+        - If back is blocked too, try turning toward the clearest side
+        - Runs for up to 2 seconds or until e-stop clears
+        """
+        sectors = self._lidar_ranges.copy() if self._lidar_ranges else {}
+        front = sectors.get('front', 0.0)
+        back = sectors.get('back', float('inf'))
+        left = sectors.get('left', float('inf'))
+        right = sectors.get('right', float('inf'))
+
+        # Temporarily lift e-stop flag so _send_twist_impl allows backward motion
+        # (e-stop only blocks forward, backward is already allowed)
+        if back > self.e_stop_dist:
+            # Back is clear — reverse
+            self.get_logger().warn(
+                f'E-stop: obstacle front at {front:.2f}m, backing up '
+                f'(back clear at {back:.2f}m)')
+            self._ramper.set_target(-0.10, 0.0)
+        elif max(left, right) > self.e_stop_dist:
+            # Back blocked too — turn toward clearest side
+            turn_dir = 0.5 if left > right else -0.5
+            side = 'left' if left > right else 'right'
+            self.get_logger().warn(
+                f'E-stop: front {front:.2f}m, back {back:.2f}m — '
+                f'turning {side}')
+            self._ramper.set_target(0.0, turn_dir)
+        else:
+            # Boxed in — just wait
+            self.get_logger().warn(
+                f'E-stop: boxed in (F={front:.2f} B={back:.2f} '
+                f'L={left:.2f} R={right:.2f}) — waiting')
+            self._stop_motors()
+            time.sleep(AGENT_IDLE_SLEEP)
+            return
+
+        # Run escape for up to 2s, checking if e-stop clears
+        t0 = time.time()
+        while time.time() - t0 < 2.0 and self.emergency_stop and self.running:
+            time.sleep(0.1)
+
+        self._stop_motors()
 
     def _move_servo(self, servo_id: int, position: int, duration: float = 0.5):
         """Move a PWM servo to a position."""
@@ -1366,10 +1469,9 @@ class AutonomousExplorer(Node):
 
     def _voice_listener_loop(self):
         """Background thread: listen for wake word, then capture command."""
-        self.get_logger().info('Voice listener started')
-        _vlog = '/tmp/voice_debug.log'
-        with open(_vlog, 'a') as _f:
-            _f.write(f'Voice listener started, wake_detector.available={self.wake_detector.available}\n')
+        self.get_logger().info(
+            f'Voice listener started '
+            f'(wake_detector.available={self.wake_detector.available})')
         while self.running:
             try:
                 # Check for wake word
@@ -1377,13 +1479,9 @@ class AutonomousExplorer(Node):
                     if self.wake_detector.check_wakeup():
                         self.get_logger().info('Wake word detected, listening 10s...')
                         self._publish_agent_status('Listening... (10s)')
-                        with open(_vlog, 'a') as _f:
-                            _f.write('Wake word detected!\n')
                         # Beep = "start speaking now", record 10s, beep = "done"
                         self.voice.beep()
                         command = self.voice.listen_for_command(duration=10)
-                        with open(_vlog, 'a') as _f:
-                            _f.write(f'STT result: "{command}" (len={len(command)})\n')
                         self.get_logger().info(
                             f'STT result: "{command}" (len={len(command)})')
                         if command:
@@ -1392,8 +1490,6 @@ class AutonomousExplorer(Node):
                             self._voice_queue.put(command)
                             self.get_logger().info(
                                 f'Voice command queued: {command}')
-                            with open(_vlog, 'a') as _f:
-                                _f.write(f'Queued: {command}\n')
                         else:
                             self.get_logger().warn(
                                 'STT returned empty — no command captured')
@@ -1402,18 +1498,24 @@ class AutonomousExplorer(Node):
                 time.sleep(0.05)
             except Exception as e:
                 self.get_logger().error(f'Voice listener error: {e}')
-                with open(_vlog, 'a') as _f:
-                    _f.write(f'Error: {e}\n')
                 time.sleep(1.0)
 
     def _process_voice_command(self, command: str) -> bool:
-        """Process voice command: repeat it back, then execute immediately."""
+        """Process voice command: cancel current action, then execute new one."""
         cmd = command.strip()
         if not cmd:
             return self.exploring
 
         self.get_logger().info(f'Voice instruction: {cmd}')
         self._publish_agent_status(f'VOICE COMMAND: "{cmd}"')
+
+        # Cancel any in-progress Nav2 navigation so the new command takes priority
+        if self.use_nav2 and self.nav2 and self.nav2.is_navigating:
+            self.nav2.cancel_navigation()
+            self.get_logger().info('Cancelled in-progress navigation for new voice command')
+
+        # Signal the agent turn loop to break early
+        self._voice_interrupt = True
 
         # Repeat the instruction back and proceed
         self.voice.speak(
@@ -1424,9 +1526,79 @@ class AutonomousExplorer(Node):
         self._publish_agent_status(f'Executing: "{cmd}"')
         self._pending_voice_instruction = cmd
 
+        # Extract search target from "find" commands for active search mode
+        self._extract_search_target(cmd)
+
         if not self.exploring:
             self.exploring = True
         return True
+
+    def _extract_search_target(self, cmd: str):
+        """Extract search target from voice commands like 'find a trash can'.
+
+        Sets self._search_target if a find/search/look-for pattern is detected.
+        Clears it on 'stop', 'go home', 'come back' commands.
+        """
+        cmd_lower = cmd.lower().strip()
+
+        # Clear search on stop/home commands
+        if any(kw in cmd_lower for kw in ('stop', 'go home', 'come back',
+                                           'return', 'cancel')):
+            if self._search_target:
+                self.get_logger().info(
+                    f'Search cancelled (was looking for: {self._search_target})'
+                    f' — searched rooms: {self._searched_rooms}')
+                self._search_target = None
+                self._searched_rooms = []
+            return
+
+        # Extract target from find/search/look-for/get/bring patterns
+        patterns = [
+            r'(?:find|search\s+for|look\s+for|locate|get|bring)\s+'
+            r'(?:me\s+)?(?:a\s+|an\s+|the\s+|some\s+)?(.+)',
+            r'(?:where\s+is|where\'s)\s+(?:the\s+|a\s+|my\s+)?(.+)',
+            r'(?:go\s+(?:find|get|look\s+for))\s+(?:a\s+|an\s+|the\s+)?(.+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, cmd_lower)
+            if match:
+                target = match.group(1).strip().rstrip('.!?')
+                if target and len(target) < 50:
+                    self._search_target = target
+                    self._search_start_cycle = self._cycle_count
+                    self._searched_rooms = []
+                    self._vlm_scan_odom = None
+                    self._last_vlm_scan_results = []
+                    # Rule 1: check knowledge FIRST before exploring
+                    self._search_knowledge_result = \
+                        self._auto_query_knowledge(target)
+                    self.get_logger().info(
+                        f'Active search started for: "{target}"'
+                        f' (knowledge: {self._search_knowledge_result})')
+                    return
+
+    def _auto_query_knowledge(self, target: str) -> dict:
+        """Rule 1: check knowledge graph before exploring.
+
+        Auto-queries the graph for the target object and returns
+        search summary. Injected into the first agent prompt so the LLM
+        knows whether to navigate directly or start searching.
+        """
+        wk = self.world_knowledge
+        # Direct lookup: do we already know where this object is?
+        room = wk.get_room_for_object(target)
+        if room:
+            return {'found': True, 'room': room, 'action': 'navigate_directly'}
+        # Get search summary with likelihood-ranked rooms
+        summary = wk.get_search_summary(target)
+        return {
+            'found': bool(summary.get('found_in')),
+            'room': summary.get('found_in', ''),
+            'searched': summary.get('searched_rooms', []),
+            'suggested_next': summary.get('suggested_next', ''),
+            'action': 'navigate_directly' if summary.get('found_in')
+                      else 'search_needed',
+        }
 
     def _publish_agent_status(self, text: str):
         """Publish a text status to /semantic_map/agent_status for Foxglove."""
@@ -1440,6 +1612,92 @@ class AutonomousExplorer(Node):
     # ======================================================================
     # Main Exploration Loop
     # ======================================================================
+
+    def _wait_for_system_ready(self, timeout: float = 90.0):
+        """Block until all subsystems are healthy before exploring.
+
+        Checks (in order):
+          1. Camera feed receiving frames
+          2. Odometry (EKF) publishing /odom
+          3. SLAM map available (/map)
+          4. Nav2 action server responding
+
+        Each check retries with 2s sleep until the total timeout expires.
+        Logs progress so the user (and log file) can see what's pending.
+        """
+        if self.provider_name in ('dryrun', 'dry-run', 'dry_run'):
+            self.get_logger().info('Dry-run mode: skipping system readiness checks')
+            return
+
+        start = time.time()
+        checks = {
+            'camera': False,
+            'odom': False,
+            'map': False,
+            'nav2': False,
+        }
+
+        while time.time() - start < timeout and self.running:
+            # Camera
+            if not checks['camera']:
+                with self._rgb_lock:
+                    if self._rgb_image is not None:
+                        checks['camera'] = True
+                        self.get_logger().info('[READY] Camera feed OK')
+
+            # Odom (EKF)
+            if not checks['odom']:
+                with self._odom_lock:
+                    if self._odom_data is not None:
+                        checks['odom'] = True
+                        self.get_logger().info('[READY] Odometry (EKF) OK')
+
+            # SLAM map
+            if not checks['map']:
+                if self.use_nav2 and self.nav2 and self.nav2.has_map:
+                    checks['map'] = True
+                    self.get_logger().info('[READY] SLAM map OK')
+                elif not self.use_nav2:
+                    checks['map'] = True  # no Nav2 = skip
+
+            # Nav2 action server
+            if not checks['nav2']:
+                if self.use_nav2 and self.nav2:
+                    if self.nav2.wait_for_nav2(timeout_sec=2.0):
+                        checks['nav2'] = True
+                        self.get_logger().info('[READY] Nav2 action server OK')
+                elif not self.use_nav2:
+                    checks['nav2'] = True  # no Nav2 = skip
+
+            if all(checks.values()):
+                elapsed = time.time() - start
+                self.get_logger().info(
+                    f'All subsystems ready ({elapsed:.1f}s)')
+                return
+
+            # Log what's still pending
+            pending = [k for k, v in checks.items() if not v]
+            elapsed = time.time() - start
+            self.get_logger().info(
+                f'Waiting for: {", ".join(pending)} '
+                f'({elapsed:.0f}s/{timeout:.0f}s)')
+            time.sleep(2.0)
+
+        # Timeout — log what failed with actionable advice
+        failed = [k for k, v in checks.items() if not v]
+        hints = {
+            'odom': 'EKF may not be publishing. Try restarting: ros2 launch autonomous_explorer jeeves_agent.launch.py',
+            'camera': 'Camera not detected. Check USB connection and camera_type launch arg.',
+            'map': 'SLAM not ready. slam_toolbox may need more time or LiDAR is not publishing.',
+            'nav2': 'Nav2 action server not responding. Nav2 may need more time to initialize.',
+        }
+        hint_lines = [f'  - {k}: {hints.get(k, "unknown")}' for k in failed]
+        self.get_logger().error(
+            f'System readiness timeout ({timeout:.0f}s). '
+            f'Missing: {", ".join(failed)}.\n' + '\n'.join(hint_lines) +
+            f'\nFix the issue and relaunch.')
+        self.running = False
+        raise SystemExit(1)
 
     def _wait_for_camera(self):
         """Block until the first camera frame arrives, or timeout.
@@ -1734,7 +1992,7 @@ class AutonomousExplorer(Node):
 
         # World knowledge
         self.world_knowledge.update_from_response(result, odom=odom)
-        for room in self.world_knowledge.world_map.get('rooms', {}):
+        for room in self.world_knowledge.get_rooms():
             self.consciousness.record_room(room)
 
         # Data logger
@@ -1852,7 +2110,7 @@ class AutonomousExplorer(Node):
         """Background thread: continuous sense -> think -> act -> speak cycle."""
         self.get_logger().info('Exploration loop started (waiting for start command)')
         self._center_camera()
-        self._wait_for_camera()
+        self._wait_for_system_ready()
 
         self.exploring = True
         self.get_logger().info('Auto-starting exploration')
@@ -1946,7 +2204,7 @@ class AutonomousExplorer(Node):
             'Agent loop started (ROSA-style tool-calling mode)'
         )
         self._center_camera()
-        self._wait_for_camera()
+        self._wait_for_system_ready()
 
         self.exploring = False
         self.get_logger().info(
@@ -1964,13 +2222,12 @@ class AutonomousExplorer(Node):
                     continue
 
                 if self.emergency_stop:
-                    self.get_logger().warn('Emergency stop — waiting for clearance')
-                    self._stop_motors()
-                    time.sleep(AGENT_IDLE_SLEEP)
+                    self._escape_obstacle()
                     continue
 
                 cycle_start = time.time()
                 self._cycle_count += 1
+                self._voice_interrupt = False  # clear before each turn
                 if self._agent_log:
                     self._agent_log.turn_start(self._cycle_count)
 
@@ -2004,6 +2261,93 @@ class AutonomousExplorer(Node):
                 )
                 self._stop_motors()
                 time.sleep(AGENT_ERROR_SLEEP)
+
+    def _should_auto_vlm_scan(self, odom: dict | None) -> bool:
+        """Check if robot has moved far enough to trigger a VLM scan.
+
+        Returns True if the robot has traveled >= SEARCH_VLM_DISTANCE_M
+        since the last auto-VLM scan (or if no scan has been done yet).
+        """
+        if not odom:
+            return False
+        x, y = odom.get('x', 0.0), odom.get('y', 0.0)
+        if self._vlm_scan_odom is None:
+            return True  # first scan — always trigger
+        dx = x - self._vlm_scan_odom[0]
+        dy = y - self._vlm_scan_odom[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+        return dist >= SEARCH_VLM_DISTANCE_M
+
+    def _run_auto_vlm_scan(self, odom: dict | None):
+        """Auto-call identify_objects() during active search.
+
+        Enforces multiple search protocol rules:
+        - Rule 4: auto-registers everything with position
+        - Rule 5: auto-labels rooms from detected objects
+        - Rule 6: marks rooms as searched in knowledge graph
+        - Rule 7: tracks scan positions for large room coverage
+        - Rule 8: flags NEW vs already-known objects
+        """
+        self.get_logger().info(
+            f'Auto-VLM scan (searching for: "{self._search_target}")')
+
+        scan_x = odom.get('x', 0.0) if odom else 0.0
+        scan_y = odom.get('y', 0.0) if odom else 0.0
+        # Record position of this scan
+        if odom:
+            self._vlm_scan_odom = (scan_x, scan_y)
+
+        try:
+            result = self._tool_registry.execute(
+                'identify_objects', {'focus_area': 'all'})
+            if not result.get('success'):
+                self._last_vlm_scan_results = []
+                self.get_logger().warn(
+                    f'Auto-VLM scan failed: {result.get("error", "?")}')
+                return
+
+            all_objects = result.get('objects', [])
+            new_objects = result.get('new_objects', [])
+            room_guess = result.get('room_guess', '')
+
+            # Rule 8: only highlight NEW objects in scan results
+            # (already-known objects are still in the list but marked)
+            self._last_vlm_scan_results = all_objects
+
+            obj_names = [o.get('name', '?') for o in all_objects]
+            new_names = new_objects if new_objects else []
+
+            # Rule 5: auto-label room from detected objects
+            if (room_guess and room_guess != 'unknown'
+                    and not self.world_knowledge._nearest_room(
+                        scan_x, scan_y, max_dist=2.0)):
+                # No known room nearby — auto-create one from the guess
+                self.world_knowledge.add_room(
+                    room_guess, x=scan_x, y=scan_y,
+                    description=f'Auto-labeled from objects: '
+                                f'{", ".join(obj_names[:5])}')
+                self.get_logger().info(
+                    f'Rule 5: auto-labeled room "{room_guess}" '
+                    f'from objects')
+
+            # Rule 6 + 7: mark room as searched with scan position
+            current_room = self.world_knowledge._nearest_room(
+                scan_x, scan_y, max_dist=3.0)
+            if current_room and self._search_target:
+                self.world_knowledge.mark_room_searched(
+                    current_room, self._search_target,
+                    scan_x=scan_x, scan_y=scan_y,
+                    new_objects_found=len(new_names))
+                if current_room not in self._searched_rooms:
+                    self._searched_rooms.append(current_room)
+
+            self.get_logger().info(
+                f'Auto-VLM scan: {obj_names} '
+                f'(new: {new_names}, room: {room_guess or current_room}, '
+                f'source: {result.get("source", "?")})')
+        except Exception as e:
+            self._last_vlm_scan_results = []
+            self.get_logger().error(f'Auto-VLM scan error: {e}')
 
     def _prepare_agent_context(self):
         """Build sensor context and conversation messages for an agent turn.
@@ -2039,6 +2383,108 @@ class AutonomousExplorer(Node):
             sensor_context += f'\n\n{yolo_text}'
 
         user_text = f'{identity_context}\n\n{sensor_context}'
+
+        # --- Active search: inject target + auto-VLM scan results ---
+        if self._search_target:
+            odom = sensors.get('odom')
+            search_turns = self._cycle_count - self._search_start_cycle
+
+            # Rule 1: inject pre-queried knowledge result on first turn
+            if self._search_knowledge_result:
+                kr = self._search_knowledge_result
+                if kr.get('found') and kr.get('room'):
+                    user_text += (
+                        f'\n\n** KNOWLEDGE GRAPH LOOKUP: "{self._search_target}" '
+                        f'was previously found in "{kr["room"]}". '
+                        f'Navigate there directly with navigate_to('
+                        f'target="{kr["room"]}", '
+                        f'object_name="{self._search_target}"). '
+                        f'Do NOT explore — go straight there. **'
+                    )
+                elif kr.get('suggested_next'):
+                    user_text += (
+                        f'\n\n** KNOWLEDGE GRAPH LOOKUP: "{self._search_target}" '
+                        f'not yet found. Already searched: '
+                        f'{kr.get("searched", [])}. '
+                        f'Suggested next room: "{kr["suggested_next"]}" '
+                        f'(ranked by likelihood). **'
+                    )
+                # Clear after first injection — subsequent turns use live summary
+                self._search_knowledge_result = None
+
+            # Rule 10: get live search summary from knowledge graph
+            summary = self.world_knowledge.get_search_summary(
+                self._search_target)
+            searched_rooms = summary.get('searched_rooms', [])
+            unsearched_rooms = summary.get('unsearched_rooms', [])
+            # Merge local tracking with graph-persisted rooms
+            for r in self._searched_rooms:
+                if r not in searched_rooms:
+                    searched_rooms.append(r)
+            rooms_str = ', '.join(searched_rooms) if searched_rooms else 'none yet'
+            unsearched_str = ', '.join(
+                unsearched_rooms[:5]) if unsearched_rooms else 'none known'
+
+            user_text += (
+                f'\n\n** ACTIVE SEARCH TARGET: "{self._search_target}" '
+                f'(searching for {search_turns} turns) **\n'
+                f'SEARCHED ROOMS: [{rooms_str}] — do NOT revisit these.\n'
+                f'UNSEARCHED ROOMS (by likelihood): [{unsearched_str}]'
+            )
+
+            if summary.get('found_in'):
+                user_text += (
+                    f'\n** OBJECT ALREADY KNOWN: "{self._search_target}" '
+                    f'is in "{summary["found_in"]}". '
+                    f'Navigate there directly! **'
+                )
+
+            # Auto-call identify_objects() when robot moves >= 1.0m
+            if self._should_auto_vlm_scan(odom):
+                self._run_auto_vlm_scan(odom)
+
+            # Inject cached VLM scan results
+            if self._last_vlm_scan_results:
+                # Rule 8: highlight only NEW objects
+                new_names = [
+                    o.get('name', '?') for o in self._last_vlm_scan_results
+                    if o.get('is_new', True)
+                ]
+                all_names = [
+                    o.get('name', '?') for o in self._last_vlm_scan_results
+                ]
+                user_text += (
+                    f'\n\n** AUTO-VLM SCAN RESULTS: '
+                    f'{", ".join(all_names)} **'
+                )
+                if new_names:
+                    user_text += (
+                        f'\nNEW objects this scan: {", ".join(new_names)}'
+                    )
+                user_text += (
+                    f'\nIs your search target "{self._search_target}" in this '
+                    f'list? If YES → IMMEDIATELY call '
+                    f'navigate_to(target="approach", '
+                    f'object_name="{self._search_target}"). '
+                    f'Do NOT explore further — approach NOW.'
+                )
+                # Check if target was found — hint strongly (Rule 9)
+                target_lower = self._search_target.lower()
+                found_names = [
+                    n for n in all_names
+                    if target_lower in n.lower() or n.lower() in target_lower
+                ]
+                if found_names:
+                    user_text += (
+                        f'\n** TARGET MATCH DETECTED: "{found_names[0]}" '
+                        f'matches your search target! APPROACH IMMEDIATELY. **'
+                    )
+            else:
+                user_text += (
+                    '\n(No VLM scan results yet — auto-scan triggers after '
+                    f'{SEARCH_VLM_DISTANCE_M}m of travel, '
+                    'or call identify_objects() manually.)'
+                )
 
         if self._pending_voice_instruction:
             user_text += (
@@ -2106,6 +2552,11 @@ class AutonomousExplorer(Node):
                 break
 
             if not self.running or self.emergency_stop:
+                break
+
+            # New voice command arrived — abort current turn so fresh context is used
+            if self._voice_interrupt:
+                self.get_logger().info('Agent turn interrupted by new voice command')
                 break
 
             # Throttle LLM calls — local models need time between requests
@@ -2217,6 +2668,16 @@ class AutonomousExplorer(Node):
 
             tool_results = []
             for tc in response.tool_calls:
+                # Check for voice interrupt between tool calls
+                if self._voice_interrupt:
+                    self.get_logger().info(
+                        f'  Skipping {tc.tool_name} — interrupted by voice command')
+                    tool_results.append({
+                        'call_id': tc.call_id,
+                        'result': '{"interrupted": true, "reason": "New voice command received"}',
+                    })
+                    continue
+
                 self.get_logger().info(
                     f'  Tool: {tc.tool_name}({_summarize_args(tc.arguments)})'
                 )
@@ -2275,6 +2736,56 @@ class AutonomousExplorer(Node):
                 if tc.tool_name == 'speak':
                     spoke_this_turn = True
 
+                # Track searched rooms during active search
+                if (self._search_target
+                        and tc.tool_name == 'label_room'
+                        and isinstance(result, dict)
+                        and result.get('success')):
+                    room = result.get('room', '')
+                    if room and room not in self._searched_rooms:
+                        self._searched_rooms.append(room)
+
+                # Rule 11 + 12: on successful approach, announce and save
+                # status='reached' for direct approach, 'arrived' for Nav2+approach
+                if (self._search_target
+                        and tc.tool_name == 'navigate_to'
+                        and isinstance(result, dict)
+                        and result.get('status') in ('reached', 'arrived')
+                        and result.get('approach', {}).get('reached',
+                            result.get('status') == 'reached')):
+                    target = self._search_target
+                    approach = result.get('approach', {})
+                    dist_m = approach.get('final_distance_m',
+                             result.get('final_distance_m', 0.1))
+                    dist_cm = int(dist_m * 100)
+                    # Determine room context
+                    with self._odom_lock:
+                        odom = dict(self._odom_data) if self._odom_data else None
+                    current_room = ''
+                    if odom:
+                        current_room = self.world_knowledge._nearest_room(
+                            odom.get('x', 0.0), odom.get('y', 0.0))
+                    # Rule 11: confirm and announce
+                    room_ctx = f' in the {current_room}' if current_room else ''
+                    announcement = (
+                        f'Sir, I found the {target}{room_ctx}, '
+                        f'{dist_cm} centimeters ahead.')
+                    if self.voice_on:
+                        try:
+                            self.voice.speak(announcement, block=False,
+                                             force=True)
+                        except Exception:
+                            pass
+                    self.get_logger().info(
+                        f'Search complete: reached "{target}"'
+                        f' — searched rooms: {self._searched_rooms}'
+                        f' — {announcement}')
+                    # Rule 12: save to graph
+                    self.world_knowledge.save()
+                    self._search_target = None
+                    self._searched_rooms = []
+                    self._search_knowledge_result = None
+
             self._conversation.add_tool_results(tool_results)
 
             if provider in ('claude',):
@@ -2304,12 +2815,19 @@ class AutonomousExplorer(Node):
     def _finalize_agent_turn(self, response, turn_cost: float,
                              sensors: dict, cycle_start: float):
         """Update dashboard, consciousness, stuck watchdog after an agent turn."""
+        reasoning = response.text[:200] if response and response.text else ''
+        response_ms = int((time.time() - cycle_start) * 1000)
+        tokens_in = response.tokens_input if response else 0
+        tokens_out = response.tokens_output if response else 0
+
         with self._llm_lock:
             s = self._llm_state
             s.action = 'agent_turn'
-            s.reasoning = response.text[:200] if response and response.text else ''
-            s.response_ms = int((time.time() - cycle_start) * 1000)
+            s.reasoning = reasoning
+            s.response_ms = response_ms
             s.cost = turn_cost
+            s.tokens_in = tokens_in
+            s.tokens_out = tokens_out
             s.timestamp = time.time()
 
         odom = sensors.get('odom')
@@ -2318,6 +2836,50 @@ class AutonomousExplorer(Node):
             {'triggered': False},
             turn_cost,
             distance_delta=self._get_odom_distance_delta(odom),
+        )
+
+        # JSONL data logging (same as legacy loop)
+        rgb = sensors.get('rgb')
+        img_h, img_w = (rgb.shape[:2] if rgb is not None else (0, 0))
+        image_b64 = sensors.get('image_b64', '')
+        self.data_logger.log_cycle(
+            rgb_image=rgb,
+            depth_image=sensors.get('depth'),
+            lidar_ranges=sensors.get('lidar_raw_ranges'),
+            lidar_sectors=sensors.get('lidar_sectors'),
+            imu_data=sensors.get('imu'),
+            odom_data=odom,
+            battery_voltage=self._battery_voltage,
+            provider=self.provider_name,
+            model=getattr(self.llm, 'model', ''),
+            system_prompt='(agent mode)',
+            user_prompt=reasoning,
+            image_resolution=f'{img_w}x{img_h}',
+            image_size_bytes=len(image_b64) * 3 // 4,
+            raw_response=response.text if response else '',
+            parsed_action='agent_turn',
+            reasoning=reasoning,
+            response_time_ms=response_ms,
+            tokens_input=tokens_in,
+            tokens_output=tokens_out,
+            cost_usd=turn_cost,
+            actual_action='agent_turn',
+            motor_left_speed=self._last_twist[0],
+            motor_right_speed=self._last_twist[1],
+            servo_pan=self._last_servo_pan,
+            servo_tilt=self._last_servo_tilt,
+            execution_duration_ms=response_ms,
+            total_distance=round(self._total_distance, 3),
+            areas_visited=self.memory.total_actions,
+            objects_discovered=[
+                d['description'][:60] for d in self.memory.discoveries[-20:]
+            ],
+            map_coverage_pct=(
+                self.nav2.get_map_stats().get('explored_pct', 0.0)
+                if self.use_nav2 and self.nav2 and self.nav2.has_map
+                else 0.0
+            ),
+            outing_number=self.consciousness.outing_number,
         )
 
         self._check_stuck_watchdog(odom)
@@ -2351,6 +2913,8 @@ class AutonomousExplorer(Node):
         self._joystick.stop()
         self.memory.save()
         self.data_logger.stop()
+        if hasattr(self, '_log_file_handle') and self._log_file_handle:
+            self._log_file_handle.close()
         self.wake_detector.stop()
         if self.nav2:
             self.nav2.cancel_navigation()

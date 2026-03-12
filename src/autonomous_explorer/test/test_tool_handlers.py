@@ -37,21 +37,97 @@ class MockVoice:
 class MockWorldKnowledge:
     def __init__(self, tmp_dir):
         self.knowledge_dir = tmp_dir
-        self.world_map = {'rooms': {}, 'corridors': [], 'doors': []}
-        self.known_objects = {'objects': {}}
-        self.learned_behaviors = {'navigation_lessons': []}
+        self._rooms = {}
+        self._objects = {}
+        self.save_called = False
+
+    @property
+    def world_map(self):
+        return {'rooms': self._rooms}
+
+    @property
+    def known_objects(self):
+        return {'objects': self._objects}
+
+    @property
+    def learned_behaviors(self):
+        return {'navigation_lessons': []}
 
     def get_prompt_context(self, x=0, y=0, theta=0):
         return ''
 
-    def _update_object(self, name, timestamp, odom=None, category=None):
-        self.known_objects.setdefault('objects', {})[name] = {
-            'first_seen': timestamp,
-            'times_seen': 1,
-            'last_seen': timestamp,
-            'usual_location': '',
-            'category': category or 'object',
+    def get_rooms(self):
+        return dict(self._rooms)
+
+    def get_objects(self):
+        return dict(self._objects)
+
+    def get_room_connections(self, room_name):
+        room = self._rooms.get(room_name, {})
+        return room.get('connections', [])
+
+    def get_room_for_object(self, object_name):
+        return self._objects.get(object_name, {}).get('room') or None
+
+    def get_room_objects(self, room_name):
+        return [n for n, d in self._objects.items()
+                if d.get('room') == room_name]
+
+    def add_room(self, name, x=0.0, y=0.0, description=''):
+        key = name.strip().lower()
+        if key in self._rooms:
+            self._rooms[key]['times_visited'] = \
+                self._rooms[key].get('times_visited', 0) + 1
+        else:
+            self._rooms[key] = {
+                'type': 'room', 'x': x, 'y': y,
+                'description': description, 'times_visited': 1,
+                'connections': [],
+            }
+        self.save()
+        return self._rooms[key]
+
+    def add_object(self, name, room='', confidence=0.7, x=0.0, y=0.0):
+        key = name.strip().lower()
+        is_new = key not in self._objects
+        self._objects[key] = {
+            'type': 'object', 'name': key,
+            'confidence': confidence, 'room': room,
+            'x': x, 'y': y, 'is_new': is_new,
         }
+        self.save()
+        return self._objects[key]
+
+    def get_known_objects_in_room(self, room_name):
+        return {n for n, d in self._objects.items()
+                if d.get('room') == room_name}
+
+    def add_connection(self, room_a, room_b):
+        a = room_a.strip().lower()
+        b = room_b.strip().lower()
+        if a not in self._rooms:
+            self.add_room(a)
+        if b not in self._rooms:
+            self.add_room(b)
+        if b not in self._rooms[a].get('connections', []):
+            self._rooms[a].setdefault('connections', []).append(b)
+        if a not in self._rooms[b].get('connections', []):
+            self._rooms[b].setdefault('connections', []).append(a)
+        self.save()
+
+    def mark_room_searched(self, room_name, target_object):
+        pass
+
+    def get_search_summary(self, target_object):
+        return {'searched_rooms': [], 'unsearched_rooms': [],
+                'objects_by_room': {}, 'suggested_next': None,
+                'found_in': None}
+
+    def _update_object(self, name, timestamp, odom=None, category=None):
+        self.add_object(name)
+
+    def _nearest_room(self, x, y, max_dist=3.0):
+        return ''
 
     def save(self):
         self.save_called = True
@@ -396,9 +472,9 @@ class TestLabelRoom:
 
     def test_stores_position(self, handlers, mock_node):
         result = handlers.label_room(room_name='Office')
-        rooms = mock_node.world_knowledge.world_map['rooms']
-        assert 'position' in rooms['office']
-        assert rooms['office']['position']['x'] == 1.0
+        rooms = mock_node.world_knowledge.get_rooms()
+        assert 'office' in rooms
+        assert rooms['office']['x'] == 1.0
 
     def test_increments_visits(self, handlers, mock_node):
         handlers.label_room(room_name='Hall')
@@ -427,16 +503,14 @@ class TestRegisterObject:
         )
         assert result['success'] is True
         assert result['object'] == 'fridge'
-        objs = mock_node.world_knowledge.known_objects['objects']
+        objs = mock_node.world_knowledge.get_objects()
         assert 'fridge' in objs
 
 
 class TestQueryKnowledge:
 
     def test_find_object_found(self, handlers, mock_node):
-        mock_node.world_knowledge.known_objects = {
-            'objects': {'chair': {'category': 'furniture'}},
-        }
+        mock_node.world_knowledge.add_object('chair', room='office')
         result = handlers.query_knowledge(query_type='find_object', query='chair')
         assert result['success'] is True
         assert 'chair' in result['results']
@@ -447,33 +521,26 @@ class TestQueryKnowledge:
         assert len(result['results']) == 0
 
     def test_describe_room(self, handlers, mock_node):
-        mock_node.world_knowledge.world_map = {
-            'rooms': {'kitchen': {'description': 'Big kitchen', 'connections': []}},
-        }
+        mock_node.world_knowledge.add_room('kitchen', description='Big kitchen')
         result = handlers.query_knowledge(query_type='describe_room', query='kitchen')
         assert result['success'] is True
         assert result['info']['description'] == 'Big kitchen'
 
     def test_list_rooms(self, handlers, mock_node):
-        mock_node.world_knowledge.world_map = {
-            'rooms': {'a': {}, 'b': {}},
-        }
+        mock_node.world_knowledge.add_room('a')
+        mock_node.world_knowledge.add_room('b')
         result = handlers.query_knowledge(query_type='list_rooms', query='')
         assert result['count'] == 2
 
     def test_list_objects(self, handlers, mock_node):
-        mock_node.world_knowledge.known_objects = {
-            'objects': {
-                'chair': {'category': 'furniture', 'usual_location': 'office'},
-            },
-        }
+        mock_node.world_knowledge.add_object('chair', room='office')
         result = handlers.query_knowledge(query_type='list_objects', query='')
         assert result['count'] == 1
 
     def test_room_connections(self, handlers, mock_node):
-        mock_node.world_knowledge.world_map = {
-            'rooms': {'hall': {'connections': ['kitchen', 'bedroom']}},
-        }
+        mock_node.world_knowledge.add_room('hall')
+        mock_node.world_knowledge.add_connection('hall', 'kitchen')
+        mock_node.world_knowledge.add_connection('hall', 'bedroom')
         result = handlers.query_knowledge(
             query_type='room_connections', query='hall',
         )

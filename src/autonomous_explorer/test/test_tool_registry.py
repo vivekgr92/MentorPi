@@ -193,7 +193,7 @@ class TestFormatConversion:
     def test_to_claude_tools(self):
         reg = create_registry()
         tools = reg.to_claude_tools()
-        assert len(tools) == 14
+        assert len(tools) == 7
         for t in tools:
             assert 'name' in t
             assert 'description' in t
@@ -203,7 +203,7 @@ class TestFormatConversion:
     def test_to_openai_tools(self):
         reg = create_registry()
         tools = reg.to_openai_tools()
-        assert len(tools) == 14
+        assert len(tools) == 7
         for t in tools:
             assert t['type'] == 'function'
             assert 'name' in t['function']
@@ -218,26 +218,26 @@ class TestFormatConversion:
 
     def test_to_provider_tools(self):
         reg = create_registry()
-        assert len(reg.to_provider_tools('claude')) == 14
-        assert len(reg.to_provider_tools('openai')) == 14
+        assert len(reg.to_provider_tools('claude')) == 7
+        assert len(reg.to_provider_tools('openai')) == 7
 
 
 # ===================================================================
-# build_jeeves_tools — all 14 tools
+# build_jeeves_tools — 7 hackathon demo tools
 # ===================================================================
 
 class TestBuildJeevesTools:
 
     EXPECTED_TOOLS = {
-        'navigate_to', 'explore_frontier', 'move_direct', 'go_home',
-        'look_around', 'identify_objects', 'describe_scene', 'check_surroundings',
-        'label_room', 'register_object', 'query_knowledge', 'save_map',
-        'speak', 'listen',
+        'navigate_to', 'explore_frontier', 'go_home',
+        'identify_objects',
+        'label_room', 'query_knowledge',
+        'speak',
     }
 
-    def test_returns_14_tools(self):
+    def test_returns_7_tools(self):
         tools = build_jeeves_tools()
-        assert len(tools) == 14
+        assert len(tools) == 7
 
     def test_all_expected_tools_present(self):
         tools = build_jeeves_tools()
@@ -259,13 +259,10 @@ class TestBuildJeevesTools:
         assert 'target' in nav.parameters['properties']
         assert 'target' in nav.parameters.get('required', [])
 
-    def test_move_direct_has_required_params(self):
+    def test_identify_objects_has_focus_area(self):
         tools = {t.name: t for t in build_jeeves_tools()}
-        move = tools['move_direct']
-        props = move.parameters['properties']
-        assert 'action' in props
-        assert 'speed' in props
-        assert 'duration' in props
+        io = tools['identify_objects']
+        assert 'focus_area' in io.parameters['properties']
 
     def test_speak_has_text_param(self):
         tools = {t.name: t for t in build_jeeves_tools()}
@@ -291,9 +288,9 @@ class TestBuildJeevesTools:
 
 class TestCreateRegistry:
 
-    def test_returns_registry_with_14_tools(self):
+    def test_returns_registry_with_7_tools(self):
         reg = create_registry()
-        assert len(reg.tool_names) == 14
+        assert len(reg.tool_names) == 7
 
     def test_all_tools_have_no_handlers(self):
         reg = create_registry()

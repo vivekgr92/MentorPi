@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # encoding: utf-8
 """
-Tool Handlers — implements the 14 Jeeves tool functions.
+Tool Handlers — implements the 7 registered Jeeves tool functions.
 
 Each handler method takes keyword arguments matching the tool's JSON schema
 and returns a dict with at least {'success': bool, ...}.
@@ -28,10 +28,13 @@ from autonomous_explorer.config import (
 
 
 class ToolHandlers:
-    """Implements all 14 Jeeves tool handler methods.
+    """Implements the 7 registered Jeeves tool handler methods.
 
     Takes a reference to the AutonomousExplorer node to access
     sensors, actuators, Nav2, world knowledge, voice, and LLM.
+
+    Legacy handlers (move_direct, look_around, describe_scene, etc.)
+    remain as methods but are NOT bound to the registry.
     """
 
     def __init__(self, node):
@@ -66,10 +69,25 @@ class ToolHandlers:
     # ------------------------------------------------------------------
 
     def navigate_to(self, target: str, x: float = 0.0, y: float = 0.0,
-                    speech: str = '') -> dict:
-        """Navigate to a named location or coordinates."""
+                    object_name: str = '', speech: str = '') -> dict:
+        """Navigate to a named location or coordinates.
+
+        If object_name is set, after Nav2 arrives at the area the robot
+        does a LiDAR+depth guided final approach and stops ~10cm from the
+        object.
+        """
         if speech:
             self._speak_async(speech)
+
+        # If object_name is set and target is "approach" (or object is nearby),
+        # skip Nav2 and go straight to YOLO-guided approach
+        if object_name and target == 'approach':
+            approach = self._approach_object(object_name)
+            return {
+                'success': approach.get('reached', False),
+                'status': 'reached' if approach.get('reached') else 'approach_failed',
+                'approach': approach,
+            }
 
         # Resolve named location from world knowledge
         if target != 'coordinates':
@@ -101,6 +119,9 @@ class ToolHandlers:
                 if self._node.emergency_stop:
                     self._node.nav2.cancel_navigation()
                     return {'success': False, 'error': 'Emergency stop during navigation'}
+                if self._node._voice_interrupt:
+                    self._node.nav2.cancel_navigation()
+                    return {'success': False, 'error': 'Interrupted by new voice command'}
                 # Return after interval so LLM can re-evaluate
                 if time.time() - t_start >= NAV2_TOOL_REEVAL_INTERVAL:
                     fb = self._node.nav2.navigation_feedback or {}
@@ -112,15 +133,138 @@ class ToolHandlers:
                 time.sleep(0.5)
 
             result = self._node.nav2.navigation_result
-            return {
-                'success': result == 'succeeded',
-                'status': result or 'timeout',
-            }
+            if result != 'succeeded':
+                return {
+                    'success': False,
+                    'status': result or 'timeout',
+                }
+
+            # Nav2 arrived — do final object approach if requested
+            if object_name:
+                approach = self._approach_object(object_name)
+                return {
+                    'success': True,
+                    'status': 'arrived',
+                    'approach': approach,
+                }
+
+            return {'success': True, 'status': 'arrived'}
 
         # Fallback: no Nav2 available
         return {
             'success': False,
             'error': 'Nav2 not available. Use move_direct for short movements.',
+        }
+
+    def _approach_object(self, object_name: str) -> dict:
+        """Sensor-guided final approach — stop ~10cm from the object.
+
+        Uses LiDAR front sector (primary, 10Hz) + depth camera center ROI
+        (secondary) to measure distance. No YOLO needed — the VLM already
+        confirmed the object is visible and the robot is pointed at it.
+
+        Called after Nav2 brings the robot to the general area, or directly
+        when target="approach".
+        """
+        import numpy as np
+
+        STOP_DISTANCE_M = 0.10   # stop ~10cm from target object
+        SLOW_DISTANCE_M = 0.40   # slow down within 40cm
+        MAX_STEPS = 40           # ~20 seconds max
+        STEP_DURATION = 0.3      # seconds per step
+        FAST_SPEED = 0.10        # m/s — normal approach
+        SLOW_SPEED = 0.05        # m/s — final creep
+        NO_PROGRESS_LIMIT = 8    # steps with no distance change = stuck
+
+        self._log.info(f'Approaching "{object_name}" using LiDAR + depth')
+
+        last_dist = float('inf')
+        no_progress_count = 0
+
+        for step in range(MAX_STEPS):
+            if self._node.emergency_stop or not self._node.running:
+                self._node._stop_motors()
+                return {'reached': False, 'error': 'emergency stop'}
+
+            if self._node._voice_interrupt:
+                self._node._stop_motors()
+                return {'reached': False, 'error': 'interrupted'}
+
+            # --- Get distance from LiDAR front sector (primary) ---
+            lidar_dist = float('inf')
+            if self._node._lidar_ranges:
+                lidar_dist = self._node._lidar_ranges.get('front', float('inf'))
+
+            # --- Get distance from depth camera center ROI (secondary) ---
+            depth_dist = float('inf')
+            with self._node._depth_lock:
+                depth_img = self._node._depth_image
+                if depth_img is not None:
+                    h, w = depth_img.shape[:2]
+                    # Sample center 20% of frame
+                    cy, cx = h // 2, w // 2
+                    r = max(10, min(h, w) // 10)
+                    roi = depth_img[cy - r:cy + r, cx - r:cx + r]
+                    valid = roi[(roi > 0) & (roi < 40000)]
+                    if len(valid) > 0:
+                        depth_dist = float(np.median(valid)) / 1000.0
+
+            # Use the smaller of the two (most conservative)
+            dist = min(lidar_dist, depth_dist)
+
+            self._log.info(
+                f'Approach step {step}: lidar={lidar_dist:.2f}m, '
+                f'depth={depth_dist:.2f}m, using={dist:.2f}m')
+
+            # Close enough — stop
+            if dist <= STOP_DISTANCE_M:
+                self._node._stop_motors()
+                self._log.info(
+                    f'Reached "{object_name}" at {dist:.2f}m '
+                    f'(lidar={lidar_dist:.2f}, depth={depth_dist:.2f})')
+                return {
+                    'reached': True,
+                    'final_distance_m': round(dist, 2),
+                    'lidar_m': round(lidar_dist, 2),
+                    'depth_m': round(depth_dist, 2),
+                }
+
+            # No valid readings from either sensor
+            if dist == float('inf'):
+                self._node._stop_motors()
+                if step == 0:
+                    return {'reached': False, 'error': 'no distance readings from LiDAR or depth'}
+                # Already moved some — stop where we are
+                return {
+                    'reached': True,
+                    'final_distance_m': -1,
+                    'note': 'lost sensor readings, stopped at current position',
+                }
+
+            # Stuck detection — if distance isn't decreasing, abort
+            if abs(dist - last_dist) < 0.02:
+                no_progress_count += 1
+                if no_progress_count >= NO_PROGRESS_LIMIT:
+                    self._node._stop_motors()
+                    return {
+                        'reached': True,
+                        'final_distance_m': round(dist, 2),
+                        'note': f'stopped — no progress after {no_progress_count} steps',
+                    }
+            else:
+                no_progress_count = 0
+            last_dist = dist
+
+            # Speed: slow creep when close, faster when far
+            speed = SLOW_SPEED if dist < SLOW_DISTANCE_M else FAST_SPEED
+            self._node._ramper.set_target(speed, 0.0)
+            time.sleep(STEP_DURATION)
+
+        self._node._stop_motors()
+        return {
+            'reached': True,
+            'final_distance_m': round(last_dist, 2),
+            'note': 'max steps reached',
         }
 
     def explore_frontier(self, preference: str = 'nearest',
@@ -159,6 +303,8 @@ class ToolHandlers:
                 return {'success': False, 'error': 'Emergency stop during frontier exploration'}
             # Return after interval so LLM can re-evaluate
             if time.time() - t_start >= NAV2_TOOL_REEVAL_INTERVAL:
+                # Mark visited even for in-progress — we've committed to this frontier
+                self._node.nav2.mark_frontier_visited(goal['x'], goal['y'])
                 fb = self._node.nav2.navigation_feedback or {}
                 return {
                     'success': True,
@@ -172,6 +318,8 @@ class ToolHandlers:
         # Navigation completed or timed out
         result = self._node.nav2.navigation_result
         if result == 'succeeded':
+            # Mark this frontier as visited so we don't return to it
+            self._node.nav2.mark_frontier_visited(goal['x'], goal['y'])
             return {
                 'success': True,
                 'status': 'arrived',
@@ -296,22 +444,45 @@ class ToolHandlers:
         if not objects and source == 'none':
             return {'success': False, 'error': 'No camera frame and no YOLO detector available'}
 
-        # Auto-register detected objects in the knowledge graph
+        # Rule 4: Auto-register ALL detected objects with position
         odom = self._get_odom()
-        now = datetime.now().isoformat(timespec='seconds')
+        ox = odom.get('x', 0.0) if odom else 0.0
+        oy = odom.get('y', 0.0) if odom else 0.0
+        # Determine current room from odom position
+        current_room = ''
+        if odom:
+            current_room = self._node.world_knowledge._nearest_room(ox, oy)
+        if not current_room and room_guess and room_guess != 'unknown':
+            current_room = room_guess
+
+        # Rule 8: track which objects are NEW vs already known
+        known_in_room = set()
+        if current_room:
+            known_in_room = self._node.world_knowledge.get_known_objects_in_room(
+                current_room)
+
         registered = []
+        new_objects = []
         for obj in objects:
             name = (obj.get('name') or '').lower().strip()
             if name and name not in ('unknown', 'object'):
                 try:
-                    self._node.world_knowledge._update_object(
-                        name, now, odom, category='detected')
+                    result = self._node.world_knowledge.add_object(
+                        name, room=current_room, confidence=0.7,
+                        x=ox, y=oy)
                     registered.append(name)
-                except Exception:
-                    pass
+                    if result.get('is_new') and name not in known_in_room:
+                        new_objects.append(name)
+                        obj['is_new'] = True
+                    else:
+                        obj['is_new'] = False
+                except Exception as e:
+                    self._log.debug(
+                        f'Auto-register skipped for {name}: {e}')
         if registered:
-            self._node.world_knowledge.save()
-            self._log.info(f'Auto-registered objects: {registered}')
+            self._log.info(
+                f'Auto-registered objects: {registered} '
+                f'(new: {new_objects})')
 
         return {
             'success': True,
@@ -319,6 +490,7 @@ class ToolHandlers:
             'description': description,
             'room_guess': room_guess,
             'registered': registered,
+            'new_objects': new_objects,
             'source': source,
         }
 
@@ -420,53 +592,23 @@ class ToolHandlers:
             self._speak_async(speech)
 
         odom = self._get_odom()
-        now = datetime.now().isoformat(timespec='seconds')
-
-        rooms = self._node.world_knowledge.world_map.setdefault('rooms', {})
+        wk = self._node.world_knowledge
         name = room_name.strip().lower()
 
-        if name in rooms:
-            rooms[name]['times_visited'] = rooms[name].get('times_visited', 0) + 1
-            rooms[name]['last_visited'] = now
-            if description:
-                rooms[name]['description'] = description
-        else:
-            rooms[name] = {
-                'first_discovered': now,
-                'times_visited': 1,
-                'last_visited': now,
-                'description': description,
-                'connections': connections or [],
-                'landmarks': [],
-                'notes': '',
-                'confidence': 0.7,
-            }
+        x = round(odom.get('x', 0), 2) if odom else 0.0
+        y = round(odom.get('y', 0), 2) if odom else 0.0
 
-        # Store position if we have odometry
-        if odom:
-            rooms[name]['position'] = {
-                'x': round(odom.get('x', 0), 2),
-                'y': round(odom.get('y', 0), 2),
-            }
+        wk.add_room(name, x=x, y=y, description=description)
 
         # Add connections bidirectionally
         if connections:
             for conn in connections:
-                conn_lower = conn.strip().lower()
-                if conn_lower in rooms:
-                    existing_conns = rooms[conn_lower].setdefault('connections', [])
-                    if name not in existing_conns:
-                        existing_conns.append(name)
-                rooms[name].setdefault('connections', [])
-                if conn_lower not in rooms[name]['connections']:
-                    rooms[name]['connections'].append(conn_lower)
+                wk.add_connection(name, conn)
 
         # Record in consciousness
         self._node.consciousness.record_room(name)
 
-        # Persist to disk so semantic_map_publisher picks up changes
-        self._node.world_knowledge.save()
-
+        rooms = wk.get_rooms()
         return {
             'success': True,
             'room': name,
@@ -478,26 +620,20 @@ class ToolHandlers:
                         room: str = '', description: str = '') -> dict:
         """Register an object in the knowledge graph."""
         odom = self._get_odom()
-        now = datetime.now().isoformat(timespec='seconds')
+        wk = self._node.world_knowledge
 
-        self._node.world_knowledge._update_object(
-            object_name.lower(), now, odom, category)
+        # If no room specified, find nearest room from odom
+        if not room and odom:
+            room = wk._nearest_room(
+                odom.get('x', 0.0), odom.get('y', 0.0))
 
-        obj_entry = self._node.world_knowledge.known_objects.get(
-            'objects', {}).get(object_name.lower(), {})
-
-        if room:
-            obj_entry['usual_location'] = room
-        if description:
-            obj_entry['description'] = description
-
-        # Persist to disk so semantic_map_publisher picks up changes
-        self._node.world_knowledge.save()
+        wk.add_object(object_name.lower(), room=room, confidence=0.7)
 
         return {
             'success': True,
             'object': object_name.lower(),
             'category': category,
+            'room': room,
             'position': odom,
         }
 
@@ -507,21 +643,36 @@ class ToolHandlers:
         query_lower = query.lower().strip()
 
         if query_type == 'find_object':
-            objects = wk.known_objects.get('objects', {})
-            matches = {k: v for k, v in objects.items() if query_lower in k}
+            # Check graph for object and return its room
+            room = wk.get_room_for_object(query_lower)
+            if room:
+                objects = wk.get_objects()
+                match = objects.get(query_lower, {})
+                return {
+                    'success': True,
+                    'results': {query_lower: {**match, 'room': room}},
+                }
+            # Fuzzy match
+            objects = wk.get_objects()
+            matches = {k: v for k, v in objects.items()
+                       if query_lower in k or k in query_lower}
             if matches:
                 return {'success': True, 'results': matches}
-            return {'success': True, 'results': {}, 'message': f'Object "{query}" not found'}
+            return {'success': True, 'results': {},
+                    'message': f'Object "{query}" not found in knowledge graph'}
 
         elif query_type == 'describe_room':
-            rooms = wk.world_map.get('rooms', {})
-            room_info = rooms.get(query_lower)
-            if room_info:
-                return {'success': True, 'room': query_lower, 'info': room_info}
-            return {'success': True, 'room': query_lower, 'message': f'Room "{query}" not found'}
+            rooms = wk.get_rooms()
+            if query_lower in rooms:
+                info = rooms[query_lower]
+                info['objects'] = wk.get_room_objects(query_lower)
+                info['connections'] = wk.get_room_connections(query_lower)
+                return {'success': True, 'room': query_lower, 'info': info}
+            return {'success': True, 'room': query_lower,
+                    'message': f'Room "{query}" not found'}
 
         elif query_type == 'list_rooms':
-            rooms = wk.world_map.get('rooms', {})
+            rooms = wk.get_rooms()
             return {
                 'success': True,
                 'rooms': list(rooms.keys()),
@@ -529,9 +680,9 @@ class ToolHandlers:
             }
 
         elif query_type == 'list_objects':
-            objects = wk.known_objects.get('objects', {})
-            summary = {k: {'category': v.get('category', '?'),
-                           'location': v.get('usual_location', '?')}
+            objects = wk.get_objects()
+            summary = {k: {'confidence': v.get('confidence', 0),
+                           'room': v.get('room', '?')}
                        for k, v in objects.items()}
             return {
                 'success': True,
@@ -540,16 +691,12 @@ class ToolHandlers:
             }
 
         elif query_type == 'room_connections':
-            rooms = wk.world_map.get('rooms', {})
-            room_info = rooms.get(query_lower)
-            if room_info:
-                return {
-                    'success': True,
-                    'room': query_lower,
-                    'connections': room_info.get('connections', []),
-                }
-            return {'success': True, 'room': query_lower, 'connections': [],
-                    'message': f'Room "{query}" not found'}
+            conns = wk.get_room_connections(query_lower)
+            return {
+                'success': True,
+                'room': query_lower,
+                'connections': conns,
+            }
 
         return {'success': False, 'error': f'Unknown query_type: {query_type}'}
 
@@ -638,7 +785,12 @@ class ToolHandlers:
 
     @staticmethod
     def _guess_room(object_names: list[str]) -> str:
-        """Guess room type from detected object names."""
+        """Guess room type from detected object names (high-confidence only).
+
+        Uses a narrow set of strong-signal objects for confident room labeling.
+        For broad search prioritization, see ROOM_OBJECT_LIKELIHOOD in
+        world_knowledge.py instead.
+        """
         names = set(o.lower() for o in object_names)
         if names & {'oven', 'microwave', 'refrigerator', 'sink', 'toaster'}:
             return 'kitchen'

@@ -356,17 +356,41 @@ class Nav2Bridge:
         self._map_render_time = time.time()
         return img
 
+    # Visited frontier tracking — prevents re-navigating to same spot
+    _visited_frontiers: list[tuple[float, float]] = []
+    _VISITED_RADIUS = 0.8  # meters — frontiers within this radius of a visited point are skipped
+
+    def mark_frontier_visited(self, x: float, y: float):
+        """Mark a frontier as visited so it won't be returned again."""
+        self._visited_frontiers.append((x, y))
+
+    def clear_visited_frontiers(self):
+        """Reset visited frontier history (e.g. on new exploration session)."""
+        self._visited_frontiers = []
+
+    def _is_frontier_visited(self, wx: float, wy: float) -> bool:
+        """Check if a frontier is too close to any previously visited frontier."""
+        for vx, vy in self._visited_frontiers:
+            if math.sqrt((wx - vx) ** 2 + (wy - vy) ** 2) < self._VISITED_RADIUS:
+                return True
+        return False
+
     def get_frontier_goals(
         self,
         robot_x: float,
         robot_y: float,
-        min_distance: float = 0.5,
+        min_distance: float = 1.0,
         max_goals: int = 5,
     ) -> list[dict]:
         """Find frontier clusters and return them as potential goals.
 
         Returns a list of dicts: [{'x': float, 'y': float, 'size': int}, ...]
         sorted by distance from robot (nearest first).
+
+        Filters out:
+          - Frontiers closer than min_distance (default 1.0m)
+          - Frontiers within _VISITED_RADIUS of any previously visited frontier
+          - Tiny clusters (< 3 cells)
         """
         with self._map_lock:
             if self._map_msg is None:
@@ -406,6 +430,10 @@ class Nav2Bridge:
 
             dist = math.sqrt((wx - robot_x) ** 2 + (wy - robot_y) ** 2)
             if dist < min_distance:
+                continue
+
+            # Skip already-visited frontiers
+            if self._is_frontier_visited(wx, wy):
                 continue
 
             goals.append({

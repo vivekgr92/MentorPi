@@ -155,8 +155,9 @@ def build_jeeves_tools() -> list[ToolDefinition]:
                     'target': {
                         'type': 'string',
                         'description': (
-                            'Room name (e.g. "kitchen") or "coordinates" '
-                            'for raw x/y.'
+                            'Room name (e.g. "kitchen"), "coordinates" '
+                            'for raw x/y, or "approach" to drive directly '
+                            'toward a visible object (requires object_name).'
                         ),
                     },
                     'x': {
@@ -166,6 +167,15 @@ def build_jeeves_tools() -> list[ToolDefinition]:
                     'y': {
                         'type': 'number',
                         'description': 'Map y in meters (required if target="coordinates").',
+                    },
+                    'object_name': {
+                        'type': 'string',
+                        'description': (
+                            'If set, after arriving at the target area the robot '
+                            'does a sensor-guided final approach (LiDAR + depth) '
+                            'and stops ~10cm in front of the object. Use '
+                            'target="approach" to approach a visible object directly.'
+                        ),
                     },
                     'speech': {
                         'type': 'string',

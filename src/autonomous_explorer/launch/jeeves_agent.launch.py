@@ -1,20 +1,28 @@
 """
 Launch file for the Jeeves Agent: full hardware + SLAM + Nav2 + Agent.
 
-Single-command launch for the complete Jeeves hackathon demo stack:
-  1. Hardware drivers (STM32 controller, odom publisher, LiDAR, depth camera)
-  2. IMU filter chain (calibration + complementary filter → /imu)
-  3. Static TF transforms (base_footprint → lidar_frame, camera_link)
-  4. robot_localization EKF (odom_raw + imu → /odom + TF)
-  5. twist_mux (priority-based cmd_vel multiplexer)
-  6. slam_toolbox async mode (builds occupancy grid from LiDAR)
-  7. Nav2 navigation stack (DWB controller, NavFn planner)
-  8. foxglove_bridge (WebSocket visualization on port 8765)
-  9. rosbridge_websocket (JSON WebSocket bridge on port 9090 for web dashboards)
-  10. Explorer node in agent mode (ROSA-style tool-calling)
+Single-command launch for the complete Jeeves hackathon demo stack.
+Handles EVERYTHING automatically — device symlinks, environment variables,
+API keys, ROS2 middleware config — so you only need ONE command:
+
+    ros2 launch autonomous_explorer jeeves_agent.launch.py
+
+What it does before launching nodes:
+  0. Loads API keys from workspace .env file
+  1. Auto-detects USB devices (STM32, LiDAR, WonderEcho) and creates symlinks
+  2. Sets MACHINE_TYPE, LIDAR_TYPE, need_compile, RMW_IMPLEMENTATION, etc.
+  3. Validates hardware is present and warns about missing devices
+
+Then launches (staged):
+  t=0s:  Hardware drivers (STM32, odom, LiDAR, camera) + TFs + twist_mux + foxglove
+  t=3s:  IMU filter chain (calibration + complementary filter → /imu)
+  t=5s:  EKF + slam_toolbox (sensor fusion + SLAM)
+  t=12s: SLAM lifecycle manager
+  t=15s: Nav2 navigation stack (DWB controller, NavFn planner)
+  t=25s: Semantic map + Explorer agent + dashboard
 
 Usage:
-    # Full stack (all hardware + navigation + agent):
+    # Full stack — just this, nothing else needed:
     ros2 launch autonomous_explorer jeeves_agent.launch.py
 
     # With OpenAI provider:
@@ -33,6 +41,10 @@ Usage:
     ros2 launch autonomous_explorer jeeves_agent.launch.py camera_type:=ascamera
 """
 import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -40,6 +52,8 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
+    LogInfo,
+    OpaqueFunction,
     SetEnvironmentVariable,
     TimerAction,
     GroupAction,
@@ -48,6 +62,308 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pre-launch setup: runs BEFORE any nodes start
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _load_env_file():
+    """Load API keys and env vars from workspace .env file."""
+    # Walk up from this file to find the workspace root .env
+    # Works from both source (src/autonomous_explorer/launch/) and
+    # installed (install/autonomous_explorer/share/.../launch/) locations.
+    launch_file = Path(__file__).resolve()
+    candidates = [Path.home() / '.env']  # always check ~/.env as fallback
+    # Walk up looking for .env (stops at filesystem root)
+    d = launch_file.parent
+    for _ in range(10):
+        env_path = d / '.env'
+        if env_path.is_file():
+            candidates.insert(0, env_path)
+            break
+        if d == d.parent:
+            break
+        d = d.parent
+    for candidate in candidates:
+        if candidate.is_file():
+            with open(candidate) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, _, value = line.partition('=')
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+            print(f'[SETUP] Loaded env from {candidate}')
+            return
+    print('[SETUP] No .env file found (API keys must be set in environment)')
+
+
+def _setup_environment():
+    """Set all required environment variables."""
+    defaults = {
+        'MACHINE_TYPE': 'MentorPi_Tank',
+        'DEPTH_CAMERA_TYPE': 'aurora',
+        'LIDAR_TYPE': 'LD19',
+        'need_compile': 'True',
+        'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp',
+    }
+    for key, value in defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+
+    # LD_LIBRARY_PATH for CycloneDDS on Debian Trixie
+    ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+    ros_lib = '/opt/ros/jazzy/lib/aarch64-linux-gnu'
+    if ros_lib not in ld_path:
+        os.environ['LD_LIBRARY_PATH'] = f'{ros_lib}:{ld_path}' if ld_path else ros_lib
+
+
+# Load .env and set defaults at MODULE level so os.environ has API keys
+# BEFORE generate_launch_description() builds SetEnvironmentVariable actions.
+_load_env_file()
+_setup_environment()
+
+
+def _detect_and_link_device(pattern, symlink_path, label):
+    """Check for device matching glob pattern, create symlink if needed.
+
+    Returns the resolved device path or None.
+    """
+    import glob as glob_mod
+    devices = sorted(glob_mod.glob(pattern))
+    if not devices:
+        print(f'[SETUP]   {label:20s}: NOT FOUND ({pattern})')
+        # Remove stale symlink
+        if os.path.islink(symlink_path):
+            try:
+                subprocess.run(
+                    ['sudo', 'rm', '-f', symlink_path],
+                    capture_output=True, timeout=5)
+            except Exception:
+                pass
+        return None
+
+    dev = devices[0]
+    current_target = None
+    try:
+        current_target = os.path.realpath(symlink_path)
+    except OSError:
+        pass
+
+    if current_target == os.path.realpath(dev):
+        print(f'[SETUP]   {label:20s}: {dev} → {symlink_path} (already linked)')
+    else:
+        print(f'[SETUP]   {label:20s}: {dev} → {symlink_path} (creating symlink)')
+        try:
+            result = subprocess.run(
+                ['sudo', 'ln', '-sf', dev, symlink_path],
+                capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                print(f'[SETUP]   WARNING: symlink failed: {result.stderr.strip()}')
+                print(f'[SETUP]   Run manually: sudo ln -sf {dev} {symlink_path}')
+        except subprocess.TimeoutExpired:
+            print(f'[SETUP]   WARNING: sudo timed out (password prompt?)')
+            print(f'[SETUP]   Run manually: sudo ln -sf {dev} {symlink_path}')
+        except FileNotFoundError:
+            print(f'[SETUP]   WARNING: sudo not found')
+    return dev
+
+
+def _detect_ch340_lidar_vs_wonderecho():
+    """Distinguish LiDAR from WonderEcho among CH340 (ttyUSB*) devices."""
+    import glob as glob_mod
+    ttyusb = sorted(glob_mod.glob('/dev/ttyUSB*'))
+    lidar_dev = None
+    wonderecho_dev = None
+
+    for dev in ttyusb:
+        try:
+            result = subprocess.run(
+                ['udevadm', 'info', '-a', '-n', dev],
+                capture_output=True, text=True, timeout=5)
+            info = result.stdout.lower()
+        except Exception:
+            info = ''
+
+        if any(kw in info for kw in ['wonderecho', 'wonder_echo', 'ai voice', 'voice box']):
+            wonderecho_dev = dev
+        else:
+            # Default non-WonderEcho CH340 to LiDAR
+            if lidar_dev is None:
+                lidar_dev = dev
+
+    # If exactly 2 CH340 devices and WonderEcho wasn't identified by udevadm,
+    # assume the second one is WonderEcho (both appear as identical CH340s).
+    if wonderecho_dev is None and len(ttyusb) == 2 and lidar_dev is not None:
+        other = [d for d in ttyusb if d != lidar_dev]
+        if other:
+            wonderecho_dev = other[0]
+            print(f'[SETUP]   WonderEcho: guessed {wonderecho_dev} '
+                  f'(2 CH340 devices, {lidar_dev} assigned to LiDAR)')
+
+    return lidar_dev, wonderecho_dev
+
+
+def _setup_hardware():
+    """Auto-detect USB devices and create /dev symlinks.
+
+    Returns list of fatal errors (empty = all critical hardware found).
+    """
+    OK = '\033[92m OK \033[0m'       # green
+    WARN = '\033[93mMISS\033[0m'     # yellow
+    FAIL = '\033[91mFAIL\033[0m'     # red
+    LINK = '\033[96m -> \033[0m'     # cyan arrow
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+
+    print()
+    print('\033[1m  Hardware Detection\033[0m')
+    print('  ' + '-' * 50)
+
+    fatal_errors = []
+    devices = []  # collect (name, status, detail) for table
+
+    # STM32 controller — only ACM device on this robot
+    stm32 = _detect_and_link_device('/dev/ttyACM*', '/dev/rrc', 'STM32 controller')
+    if stm32:
+        devices.append(('STM32 Controller', OK, f'{stm32}{LINK}/dev/rrc'))
+    else:
+        devices.append(('STM32 Controller', FAIL, 'not found (/dev/ttyACM*)'))
+        fatal_errors.append('STM32 controller not found. Check USB to controller board.')
+
+    # CH340 devices (LiDAR and WonderEcho both use CH340)
+    lidar_dev, wonderecho_dev = _detect_ch340_lidar_vs_wonderecho()
+
+    if lidar_dev:
+        current = os.path.realpath('/dev/ldlidar') if os.path.exists('/dev/ldlidar') else None
+        if current != os.path.realpath(lidar_dev):
+            try:
+                subprocess.run(
+                    ['sudo', 'ln', '-sf', lidar_dev, '/dev/ldlidar'],
+                    capture_output=True, timeout=10)
+            except Exception:
+                pass
+        devices.append(('LiDAR (LD19)', OK, f'{lidar_dev}{LINK}/dev/ldlidar'))
+    else:
+        devices.append(('LiDAR (LD19)', FAIL, 'not found (no /dev/ttyUSB*)'))
+        fatal_errors.append('LiDAR not found. Check USB connection.')
+
+    if wonderecho_dev:
+        current = os.path.realpath('/dev/wonderecho') if os.path.exists('/dev/wonderecho') else None
+        if current != os.path.realpath(wonderecho_dev):
+            try:
+                subprocess.run(
+                    ['sudo', 'ln', '-sf', wonderecho_dev, '/dev/wonderecho'],
+                    capture_output=True, timeout=10)
+            except Exception:
+                pass
+        devices.append(('WonderEcho', OK, f'{wonderecho_dev}{LINK}/dev/wonderecho'))
+    else:
+        devices.append(('WonderEcho', WARN, f'{DIM}not found (voice disabled){RESET}'))
+
+    # Camera — detected by USB vendor ID, no symlink needed
+    try:
+        lsusb = subprocess.run(
+            ['lsusb'], capture_output=True, text=True, timeout=5)
+        if '3251:1930' in lsusb.stdout:
+            devices.append(('Depth Camera', OK, 'Aurora 930 (USB 3251:1930)'))
+        else:
+            devices.append(('Depth Camera', WARN, f'{DIM}not found{RESET}'))
+    except Exception:
+        devices.append(('Depth Camera', WARN, f'{DIM}lsusb failed{RESET}'))
+
+    # Print table
+    for name, status, detail in devices:
+        print(f'  [{status}]  {name:20s} {detail}')
+    print('  ' + '-' * 50)
+
+    return fatal_errors
+
+
+def _check_openai_connectivity():
+    """Ping OpenAI API to verify key and network connectivity."""
+    import urllib.request
+    import urllib.error
+    api_key = os.environ.get('OPENAI_API_KEY', '')
+    if not api_key:
+        print('[SETUP] OpenAI API: SKIPPED (no key)')
+        return
+    try:
+        req = urllib.request.Request(
+            'https://api.openai.com/v1/models',
+            headers={'Authorization': f'Bearer {api_key}'},
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        print(f'[SETUP] OpenAI API: OK (HTTP {resp.status})')
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print(f'[SETUP] OpenAI API: FAILED — invalid API key (HTTP 401)')
+        else:
+            print(f'[SETUP] OpenAI API: FAILED — HTTP {e.code}')
+    except Exception as e:
+        print(f'[SETUP] OpenAI API: FAILED — {e}')
+
+
+def _pre_launch_setup(context, *args, **kwargs):
+    """OpaqueFunction that runs all setup before nodes launch."""
+    print()
+    print('\033[1m' + '=' * 52 + '\033[0m')
+    print('\033[1m  Jeeves Agent — Pre-launch Setup\033[0m')
+    print('\033[1m' + '=' * 52 + '\033[0m')
+
+    # env + .env already loaded at module level, just do hardware + validation
+    hardware = LaunchConfiguration('hardware').perform(context)
+    fatal_errors = _setup_hardware()
+    if fatal_errors and hardware == 'true':
+        print()
+        print('\033[91;1m  LAUNCH ABORTED — Required hardware missing:\033[0m')
+        for err in fatal_errors:
+            print(f'\033[91m    * {err}\033[0m')
+        print()
+        print('  Fix connections and relaunch, or skip with:')
+        print('    \033[2mros2 launch autonomous_explorer jeeves_agent.launch.py hardware:=false\033[0m')
+        print()
+        import sys
+        sys.exit(1)
+
+    # Validate API keys
+    provider = LaunchConfiguration('llm_provider').perform(context)
+    if provider == 'dryrun':
+        print('[SETUP] DRY-RUN mode — no API keys needed')
+    elif provider == 'openai' and not os.environ.get('OPENAI_API_KEY'):
+        print('[SETUP] FATAL: OPENAI_API_KEY not set! LLM calls WILL fail.')
+        print('[SETUP]   Add to .env: OPENAI_API_KEY=sk-...')
+        print('[SETUP]   Or: export OPENAI_API_KEY="sk-..."')
+    elif provider == 'claude' and not os.environ.get('ANTHROPIC_API_KEY'):
+        print('[SETUP] FATAL: ANTHROPIC_API_KEY not set! LLM calls WILL fail.')
+        print('[SETUP]   Add to .env: ANTHROPIC_API_KEY=sk-ant-...')
+
+    if os.environ.get('VOICE_ENABLED', 'true') == 'true' and not os.environ.get('OPENAI_API_KEY'):
+        print('[SETUP] WARNING: OPENAI_API_KEY not set — voice TTS/STT will use fallbacks (gTTS/Google)')
+
+    # Ping OpenAI to verify connectivity + key
+    if provider in ('openai',) or os.environ.get('OPENAI_API_KEY'):
+        _check_openai_connectivity()
+
+    oai_key = os.environ.get('OPENAI_API_KEY', '')
+    ant_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    print('=' * 60)
+    print(f'  Provider:   {provider}')
+    print(f'  Machine:    {os.environ.get("MACHINE_TYPE")}')
+    print(f'  RMW:        {os.environ.get("RMW_IMPLEMENTATION")}')
+    print(f'  OpenAI key: {"SET (" + oai_key[:8] + "...)" if oai_key else "NOT SET"}')
+    print(f'  Claude key: {"SET (" + ant_key[:8] + "...)" if ant_key else "NOT SET"}')
+    print(f'  STM32:      {"OK" if os.path.exists("/dev/rrc") else "MISSING"}')
+    print(f'  LiDAR:      {"OK" if os.path.exists("/dev/ldlidar") else "MISSING"}')
+    print('=' * 60)
+
+    return []  # OpaqueFunction must return a list of actions
 
 
 def generate_launch_description():
@@ -83,7 +399,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'llm_provider',
-            default_value=os.environ.get('LLM_PROVIDER', 'claude'),
+            default_value=os.environ.get('LLM_PROVIDER', 'openai'),
             description='LLM provider: claude, openai, or dryrun',
         ),
         DeclareLaunchArgument(
@@ -113,7 +429,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'dashboard',
-            default_value='true',
+            default_value='false',
             description='Launch curses dashboard in a detached screen session (attach: screen -r jeeves_dash)',
         ),
         DeclareLaunchArgument(
@@ -283,6 +599,7 @@ def generate_launch_description():
         executable='ekf_node',
         name='ekf_filter_node',
         parameters=[ekf_params],
+        remappings=[('odometry/filtered', 'odom')],
         output='log',
         condition=IfCondition(LaunchConfiguration('use_ekf')),
     )
@@ -467,6 +784,14 @@ def generate_launch_description():
     )
 
     # ── Explorer Node (Agent Mode) ──
+    # Log directory: ~/mentorpi_explorer/logs/ (same as JSONL data logs)
+    explorer_log_dir = os.path.expanduser(
+        os.environ.get('EXPLORER_LOG_DIR', '~/mentorpi_explorer/logs'))
+    os.makedirs(explorer_log_dir, exist_ok=True)
+    explorer_log_file = os.path.join(
+        explorer_log_dir,
+        f'explorer_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+
     explorer_node = Node(
         package='autonomous_explorer',
         executable='explorer_node',
@@ -482,8 +807,11 @@ def generate_launch_description():
                 'agent_mode': True,
             },
         ],
-        output='screen',
+        output='both',
+        additional_env={'EXPLORER_LOG_FILE': explorer_log_file},
     )
+    # Log file path printed for easy access
+    print(f'[SETUP] Explorer log: {explorer_log_file}')
 
     # ── Staged Launch Sequence ──
     # Stagger startup to allow dependencies to initialize:
@@ -530,20 +858,40 @@ def generate_launch_description():
         actions=[semantic_map_node, explorer_node, dashboard_proc],
     )
 
-    # ── CycloneDDS Configuration ──
-    # ManySocketsMode=false prevents participant index exhaustion when launching
-    # 20+ nodes. This env var MUST be set via SetEnvironmentVariable so it
-    # propagates to all child processes (C++ and Python) spawned by ros2 launch.
+    # ── Pre-launch setup (env vars, symlinks, hardware detection) ──
+    pre_launch = OpaqueFunction(function=_pre_launch_setup)
+
+    # ── Environment Variables ──
+    # These MUST use SetEnvironmentVariable so they propagate to all child
+    # processes (both C++ and Python nodes) spawned by ros2 launch.
+    env_actions = [
+        SetEnvironmentVariable('MACHINE_TYPE',
+                               os.environ.get('MACHINE_TYPE', 'MentorPi_Tank')),
+        SetEnvironmentVariable('DEPTH_CAMERA_TYPE',
+                               os.environ.get('DEPTH_CAMERA_TYPE', 'aurora')),
+        SetEnvironmentVariable('LIDAR_TYPE',
+                               os.environ.get('LIDAR_TYPE', 'LD19')),
+        SetEnvironmentVariable('need_compile',
+                               os.environ.get('need_compile', 'True')),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp'),
+    ]
+
+    # CycloneDDS XML config (ManySocketsMode=false for 20+ nodes)
     cyclonedds_xml = os.path.expanduser('~/.cyclonedds.xml')
-    cyclonedds_env = []
     if os.path.exists(cyclonedds_xml):
-        cyclonedds_env = [
+        env_actions.append(
             SetEnvironmentVariable(
                 'CYCLONEDDS_URI', f'file://{cyclonedds_xml}'),
-        ]
+        )
+
+    # Forward API keys to child processes if loaded from .env
+    for key in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY'):
+        val = os.environ.get(key, '')
+        if val:
+            env_actions.append(SetEnvironmentVariable(key, val))
 
     return LaunchDescription(
-        args + cyclonedds_env + [
+        args + [pre_launch] + env_actions + [
             # Immediate: hardware drivers + TF + support nodes
             stm32_node,
             odom_node,

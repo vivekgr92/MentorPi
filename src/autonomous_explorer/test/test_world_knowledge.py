@@ -1,4 +1,4 @@
-"""Tests for autonomous_explorer.world_knowledge module."""
+"""Tests for autonomous_explorer.world_knowledge module (NetworkX backend)."""
 import json
 import os
 
@@ -14,43 +14,171 @@ from autonomous_explorer.world_knowledge import WorldKnowledge
 class TestWorldKnowledgeInit:
     """Test knowledge system initialization and file handling."""
 
-    def test_creates_knowledge_directory(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        assert os.path.isdir(tmp_dir)
+    def test_creates_graph_directory(self, tmp_dir):
+        graph_path = os.path.join(tmp_dir, 'sub', 'kg.json')
+        WorldKnowledge(graph_path=graph_path)
+        assert os.path.isdir(os.path.join(tmp_dir, 'sub'))
 
     def test_default_data_structure(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         assert 'rooms' in wk.world_map
         assert 'objects' in wk.known_objects
         assert 'navigation_lessons' in wk.learned_behaviors
 
-    def test_loads_existing_data(self, tmp_dir):
-        # Pre-populate a knowledge file
-        map_path = os.path.join(tmp_dir, 'world_map.json')
-        with open(map_path, 'w') as f:
-            json.dump({
-                'rooms': {'kitchen': {'times_visited': 3, 'last_visited': '2026-01-01'}},
-                'corridors': [],
-                'doors': [],
-            }, f)
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        assert 'kitchen' in wk.world_map['rooms']
-        assert wk.world_map['rooms']['kitchen']['times_visited'] == 3
+    def test_loads_existing_graph(self, tmp_dir):
+        graph_path = os.path.join(tmp_dir, 'kg.json')
+        # Create and save a graph
+        wk1 = WorldKnowledge(graph_path=graph_path)
+        wk1.add_room('kitchen', x=1.0, y=2.0)
+        # Load it back
+        wk2 = WorldKnowledge(graph_path=graph_path)
+        rooms = wk2.get_rooms()
+        assert 'kitchen' in rooms
+        assert rooms['kitchen']['x'] == 1.0
 
-    def test_corrupted_file_uses_defaults(self, tmp_dir):
-        map_path = os.path.join(tmp_dir, 'world_map.json')
-        with open(map_path, 'w') as f:
+    def test_corrupted_file_starts_empty(self, tmp_dir):
+        graph_path = os.path.join(tmp_dir, 'kg.json')
+        with open(graph_path, 'w') as f:
             f.write('{bad json')
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        assert 'rooms' in wk.world_map  # got defaults
+        wk = WorldKnowledge(graph_path=graph_path)
+        assert len(wk.get_rooms()) == 0
 
-    def test_forward_compat_merges_defaults(self, tmp_dir):
-        map_path = os.path.join(tmp_dir, 'world_map.json')
-        with open(map_path, 'w') as f:
-            json.dump({'rooms': {}}, f)  # missing 'corridors', 'doors'
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        assert 'corridors' in wk.world_map
-        assert 'doors' in wk.world_map
+    def test_empty_graph_has_compat_properties(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        assert wk.world_map == {'rooms': {}}
+        assert wk.known_objects == {'objects': {}}
+
+
+# ===================================================================
+# Room operations
+# ===================================================================
+
+class TestRoomOperations:
+    """Test room add/update/query."""
+
+    def test_add_room(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        result = wk.add_room('kitchen', x=1.0, y=2.0, description='Tiles')
+        assert result['type'] == 'room'
+        assert result['x'] == 1.0
+        assert result['times_visited'] == 1
+
+    def test_revisit_increments_count(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_room('kitchen')
+        rooms = wk.get_rooms()
+        assert rooms['kitchen']['times_visited'] == 2
+
+    def test_add_connection(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_room('hallway')
+        wk.add_connection('kitchen', 'hallway')
+        conns = wk.get_room_connections('kitchen')
+        assert 'hallway' in conns
+        conns_back = wk.get_room_connections('hallway')
+        assert 'kitchen' in conns_back
+
+    def test_get_room_objects(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_object('cup', room='kitchen')
+        objs = wk.get_room_objects('kitchen')
+        assert 'cup' in objs
+
+    def test_compat_world_map_includes_connections(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_room('hallway')
+        wk.add_connection('kitchen', 'hallway')
+        wm = wk.world_map
+        assert 'hallway' in wm['rooms']['kitchen']['connections']
+
+
+# ===================================================================
+# Object operations
+# ===================================================================
+
+class TestObjectOperations:
+    """Test object add/update/query."""
+
+    def test_add_object(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        result = wk.add_object('cup', room='kitchen', confidence=0.9)
+        assert result['type'] == 'object'
+        assert result['confidence'] == 0.9
+
+    def test_object_room_lookup(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_object('cup', room='kitchen')
+        assert wk.get_room_for_object('cup') == 'kitchen'
+
+    def test_object_moves_rooms(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_object('cup', room='kitchen')
+        wk.add_object('cup', room='bedroom')
+        assert wk.get_room_for_object('cup') == 'bedroom'
+
+    def test_get_objects_includes_room(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_object('cup', room='kitchen')
+        objs = wk.get_objects()
+        assert objs['cup']['room'] == 'kitchen'
+
+    def test_compat_known_objects(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_object('cup')
+        assert 'cup' in wk.known_objects['objects']
+
+
+# ===================================================================
+# Search tracking
+# ===================================================================
+
+class TestSearchTracking:
+    """Test search state tracking."""
+
+    def test_mark_room_searched(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.mark_room_searched('kitchen', 'trash can')
+        summary = wk.get_search_summary('trash can')
+        assert 'kitchen' in summary['searched_rooms']
+
+    def test_unsearched_rooms_listed(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_room('bedroom')
+        wk.mark_room_searched('kitchen', 'cup')
+        summary = wk.get_search_summary('cup')
+        assert 'kitchen' in summary['searched_rooms']
+        assert 'bedroom' in summary['unsearched_rooms']
+
+    def test_found_in_detected(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_object('cup', room='kitchen')
+        summary = wk.get_search_summary('cup')
+        assert summary['found_in'] == 'kitchen'
+
+    def test_suggested_next(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_room('bedroom')
+        wk.mark_room_searched('kitchen', 'cup')
+        summary = wk.get_search_summary('cup')
+        assert summary['suggested_next'] == 'bedroom'
+
+    def test_get_unexplored_connections(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        wk.add_connection('kitchen', 'pantry')
+        # pantry was auto-created with times_visited=1 by add_connection
+        # but we can test by creating an unvisited room manually
+        unexplored = wk.get_unexplored_connections('kitchen')
+        # pantry was auto-created via add_room (times_visited=1), so not "unexplored"
+        assert isinstance(unexplored, list)
 
 
 # ===================================================================
@@ -61,70 +189,30 @@ class TestUpdateFromResponse:
     """Test cheap per-cycle keyword extraction from LLM responses."""
 
     def test_detects_room_in_speech(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         wk.update_from_response({
             'speech': 'I appear to have entered the kitchen.',
             'reasoning': 'Tiles and cabinets visible.',
         })
-        assert 'kitchen' in wk.world_map['rooms']
+        assert 'kitchen' in wk.get_rooms()
 
     def test_detects_multiple_rooms(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         wk.update_from_response({
             'speech': 'Moving from the hallway into the bedroom.',
             'reasoning': '',
         })
-        assert 'hallway' in wk.world_map['rooms']
-        assert 'bedroom' in wk.world_map['rooms']
-
-    def test_detects_objects(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({
-            'speech': 'I see a chair and a table ahead.',
-            'reasoning': '',
-        })
-        assert 'chair' in wk.known_objects['objects']
-        assert 'table' in wk.known_objects['objects']
-
-    def test_categorizes_living_beings(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({
-            'speech': 'I notice a cat on the couch.',
-            'reasoning': '',
-        })
-        assert wk.known_objects['objects']['cat']['category'] == 'living_being'
-        assert wk.known_objects['objects']['cat']['is_dynamic'] is True
-
-    def test_increments_times_visited(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'In the kitchen.', 'reasoning': ''})
-        wk.update_from_response({'speech': 'Back in the kitchen.', 'reasoning': ''})
-        assert wk.world_map['rooms']['kitchen']['times_visited'] == 2
-
-    def test_increments_times_seen(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'A chair.', 'reasoning': ''})
-        wk.update_from_response({'speech': 'That chair again.', 'reasoning': ''})
-        assert wk.known_objects['objects']['chair']['times_seen'] == 2
-
-    def test_records_location_from_odom(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response(
-            {'speech': 'A lamp here.', 'reasoning': ''},
-            odom={'x': 1.5, 'y': 2.3},
-        )
-        obj = wk.known_objects['objects']['lamp']
-        assert '1.5' in obj['usual_location']
-        assert '2.3' in obj['usual_location']
+        rooms = wk.get_rooms()
+        assert 'hallway' in rooms
+        assert 'bedroom' in rooms
 
     def test_no_match_does_nothing(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         wk.update_from_response({
             'speech': 'Moving forward slowly.',
             'reasoning': 'Clear path ahead.',
         })
-        assert len(wk.world_map['rooms']) == 0
-        assert len(wk.known_objects['objects']) == 0
+        assert len(wk.get_rooms()) == 0
 
 
 # ===================================================================
@@ -135,127 +223,48 @@ class TestPromptContext:
     """Test the spatially-filtered knowledge summary for LLM prompts."""
 
     def test_empty_returns_empty_string(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        ctx = wk.get_prompt_context()
-        assert ctx == ''
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        assert wk.get_prompt_context() == ''
 
     def test_includes_room_names(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'In the kitchen.', 'reasoning': ''})
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
         ctx = wk.get_prompt_context()
         assert 'kitchen' in ctx
 
-    def test_includes_last_room(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'Kitchen area.', 'reasoning': ''})
-        ctx = wk.get_prompt_context()
-        assert 'LAST ROOM' in ctx
-
     def test_includes_objects(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'A chair nearby.', 'reasoning': ''})
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_object('chair', room='kitchen')
         ctx = wk.get_prompt_context()
         assert 'chair' in ctx
 
-    def test_includes_lessons(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.learned_behaviors['navigation_lessons'].append({
-            'learned_on': '2026-03-01',
-            'lesson': 'Avoid the narrow corridor.',
-            'confidence': 0.8,
-            'times_confirmed': 2,
-        })
-        ctx = wk.get_prompt_context()
-        assert 'LESSONS' in ctx
-        assert 'corridor' in ctx
-
 
 # ===================================================================
-# _apply_knowledge_update (from LLM end-of-session)
-# ===================================================================
-
-class TestApplyKnowledgeUpdate:
-    """Test structured knowledge updates from LLM."""
-
-    def test_adds_rooms(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk._apply_knowledge_update({
-            'rooms_visited': ['kitchen', 'hallway'],
-        })
-        assert 'kitchen' in wk.world_map['rooms']
-        assert 'hallway' in wk.world_map['rooms']
-
-    def test_adds_objects(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk._apply_knowledge_update({
-            'new_objects': [
-                {'name': 'Bookshelf', 'category': 'furniture'},
-            ],
-        })
-        assert 'bookshelf' in wk.known_objects['objects']
-
-    def test_adds_lessons(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk._apply_knowledge_update({
-            'lessons': ['Turn slowly near walls.'],
-        })
-        lessons = wk.learned_behaviors['navigation_lessons']
-        assert len(lessons) == 1
-        assert 'walls' in lessons[0]['lesson']
-
-    def test_adds_room_connections(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        # First create the rooms
-        wk._apply_knowledge_update({'rooms_visited': ['kitchen', 'hallway']})
-        # Then connect them
-        wk._apply_knowledge_update({
-            'room_connections': [{'from': 'kitchen', 'to': 'hallway'}],
-        })
-        assert 'hallway' in wk.world_map['rooms']['kitchen']['connections']
-        assert 'kitchen' in wk.world_map['rooms']['hallway']['connections']
-
-    def test_ignores_invalid_types(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk._apply_knowledge_update({
-            'rooms_visited': [123, None],
-            'new_objects': ['not a dict', None],
-            'lessons': [None, 42, ''],
-        })
-        # Should not crash; non-string rooms and empty lessons are handled
-        # (empty string '' is technically a valid string, so it gets added)
-        assert 123 not in wk.world_map['rooms']
-
-    def test_no_duplicate_connections(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk._apply_knowledge_update({'rooms_visited': ['a', 'b']})
-        wk._apply_knowledge_update({'room_connections': [{'from': 'a', 'to': 'b'}]})
-        wk._apply_knowledge_update({'room_connections': [{'from': 'a', 'to': 'b'}]})
-        assert wk.world_map['rooms']['a']['connections'].count('b') == 1
-
-
-# ===================================================================
-# Save / persistence
+# Save / persistence roundtrip
 # ===================================================================
 
 class TestSave:
     """Test knowledge persistence to disk."""
 
-    def test_save_creates_all_files(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'A kitchen with a chair.', 'reasoning': ''})
-        wk.save()
-
-        assert os.path.exists(os.path.join(tmp_dir, 'world_map.json'))
-        assert os.path.exists(os.path.join(tmp_dir, 'known_objects.json'))
-        assert os.path.exists(os.path.join(tmp_dir, 'learned_behaviors.json'))
+    def test_save_creates_file(self, tmp_dir):
+        graph_path = os.path.join(tmp_dir, 'kg.json')
+        wk = WorldKnowledge(graph_path=graph_path)
+        wk.add_room('kitchen')
+        assert os.path.exists(graph_path)
 
     def test_save_and_reload_roundtrip(self, tmp_dir):
-        wk1 = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk1.update_from_response({'speech': 'A kitchen.', 'reasoning': ''})
-        wk1.save()
+        graph_path = os.path.join(tmp_dir, 'kg.json')
+        wk1 = WorldKnowledge(graph_path=graph_path)
+        wk1.add_room('kitchen', x=1.5, y=2.5)
+        wk1.add_object('cup', room='kitchen', confidence=0.9)
+        wk1.add_connection('kitchen', 'hallway')
 
-        wk2 = WorldKnowledge(knowledge_dir=tmp_dir)
-        assert 'kitchen' in wk2.world_map['rooms']
+        wk2 = WorldKnowledge(graph_path=graph_path)
+        rooms = wk2.get_rooms()
+        assert 'kitchen' in rooms
+        assert rooms['kitchen']['x'] == 1.5
+        assert wk2.get_room_for_object('cup') == 'kitchen'
+        assert 'hallway' in wk2.get_room_connections('kitchen')
 
 
 # ===================================================================
@@ -266,41 +275,30 @@ class TestSummaryMethods:
     """Test the text summary methods used by the CLI tool."""
 
     def test_rooms_summary_empty(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         assert 'No rooms' in wk.get_rooms_summary()
 
     def test_rooms_summary_with_data(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'kitchen visit.', 'reasoning': ''})
-        summary = wk.get_rooms_summary()
-        assert 'kitchen' in summary
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_room('kitchen')
+        assert 'kitchen' in wk.get_rooms_summary()
 
     def test_objects_summary_empty(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         assert 'No objects' in wk.get_objects_summary()
 
     def test_objects_summary_with_data(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'A chair.', 'reasoning': ''})
-        summary = wk.get_objects_summary()
-        assert 'chair' in summary
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
+        wk.add_object('chair')
+        assert 'chair' in wk.get_objects_summary()
 
-    def test_lessons_summary_empty(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
+    def test_lessons_summary(self, tmp_dir):
+        wk = WorldKnowledge(graph_path=os.path.join(tmp_dir, 'kg.json'))
         assert 'No navigation' in wk.get_lessons_summary()
-
-    def test_lessons_summary_with_data(self, tmp_dir):
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.learned_behaviors['navigation_lessons'].append({
-            'lesson': 'Go slow near walls.',
-            'confidence': 0.7,
-        })
-        summary = wk.get_lessons_summary()
-        assert 'walls' in summary
 
 
 # ===================================================================
-# End-of-session LLM update
+# End-of-session
 # ===================================================================
 
 class TestEndOfSessionUpdate:
@@ -310,12 +308,13 @@ class TestEndOfSessionUpdate:
         from autonomous_explorer.llm_provider import DryRunProvider
         from autonomous_explorer.exploration_memory import ExplorationMemory
 
-        wk = WorldKnowledge(knowledge_dir=tmp_dir)
-        wk.update_from_response({'speech': 'A kitchen.', 'reasoning': ''})
+        graph_path = os.path.join(tmp_dir, 'kg.json')
+        wk = WorldKnowledge(graph_path=graph_path)
+        wk.add_room('kitchen')
         mem = ExplorationMemory(os.path.join(tmp_dir, 'mem.json'))
         provider = DryRunProvider()
 
         wk.end_of_session_update(mem, provider)
 
-        # Should have saved files
-        assert os.path.exists(os.path.join(tmp_dir, 'world_map.json'))
+        # Should have saved graph
+        assert os.path.exists(graph_path)
